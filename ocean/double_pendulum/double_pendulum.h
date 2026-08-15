@@ -112,8 +112,6 @@ void c_reset(DoublePendulum* env) {
     env->episode_return = 0.0f;
     env->upright_steps = 0;
     env->max_upright_steps = 0;
-    env->rewards[0] = 0.0f;
-    env->terminals[0] = 0.0f;
     compute_observations(env);
 }
 
