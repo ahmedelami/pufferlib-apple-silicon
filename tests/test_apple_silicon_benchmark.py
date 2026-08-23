@@ -71,6 +71,12 @@ def test_run_summary_keeps_raw_samples_and_complete_effective_config(
         host_horizon_io=False,
         mps_host_alias_io=False,
         policy_compile_wrapper_verified=True,
+        ppo_compile_requested='inductor',
+        ppo_compile_effective='inductor',
+        ppo_compile_reason='validated fused PPO graph',
+        ppo_compile_preflight=True,
+        ppo_compile_wrapper_verified=True,
+        ppo_compile_startup_seconds=0.25,
         rollout_sampler_requested='fused_mps_philox',
         rollout_sampler_effective='torch_multinomial',
         rollout_sampler_reason='compiled path inactive',
@@ -129,6 +135,12 @@ def test_run_summary_keeps_raw_samples_and_complete_effective_config(
     assert result['rollout_sampler_startup_seconds'] == 0.125
     assert result['optimization_startup_seconds'] == 0.5
     assert result['policy_compile_wrapper_verified'] is True
+    assert result['requested_ppo_compile'] == 'inductor'
+    assert result['effective_ppo_compile'] == 'inductor'
+    assert result['ppo_compile_reason'] == 'validated fused PPO graph'
+    assert result['ppo_compile_preflight'] is True
+    assert result['ppo_compile_wrapper_verified'] is True
+    assert result['ppo_compile_startup_seconds'] == 0.25
     json.dumps(result)
 
 
@@ -260,6 +272,12 @@ def test_system_metadata_json_shape_without_accelerator_work(monkeypatch):
     monkeypatch.setattr(benchmark.torch.cuda, 'is_available', lambda: False)
     monkeypatch.setattr(benchmark.torch.backends.mps, 'is_built', lambda: True)
     monkeypatch.setattr(benchmark.torch.backends.mps, 'is_available', lambda: True)
+    for name in (
+            'TORCHINDUCTOR_FORCE_LAYOUT_OPT',
+            'TORCHINDUCTOR_LAYOUT_OPTIMIZATION',
+            'TORCHDYNAMO_DISABLE',
+            'TORCH_BISECT_BACKEND'):
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv('PYTORCH_ENABLE_MPS_FALLBACK', '0')
 
     metadata = benchmark.system_metadata()

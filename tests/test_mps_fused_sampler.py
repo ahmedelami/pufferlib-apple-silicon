@@ -120,6 +120,46 @@ def test_sampler_auto_falls_back_but_explicit_mode_fails_closed(monkeypatch):
         )
 
 
+@pytest.mark.parametrize("amp_dtype", [None, torch.bfloat16])
+def test_sampler_accepts_validated_float32_and_bfloat16_amp(
+        monkeypatch, amp_dtype):
+    import pufferlib.mps_kernels as kernels
+
+    sentinel = object()
+    monkeypatch.setattr(
+        kernels, "MPSCategoricalSampler", lambda *args: sentinel)
+    sampler, requested, effective, reason, _ = (
+        torch_pufferl.configure_rollout_sampler(
+            _sampler_args("inductor"),
+            _sampler_vec(),
+            "mps",
+            "mps",
+            amp_dtype,
+            True,
+            "inductor",
+            "inductor",
+        )
+    )
+    assert sampler is sentinel
+    assert requested == "fused_mps_philox"
+    assert effective == "fused_mps_philox"
+    assert "validated Breakout" in reason
+
+
+def test_sampler_rejects_float16_amp():
+    with pytest.raises(RuntimeError, match="AMP dtype is not float32 or bfloat16"):
+        torch_pufferl.configure_rollout_sampler(
+            _sampler_args("inductor"),
+            _sampler_vec(),
+            "mps",
+            "mps",
+            torch.float16,
+            True,
+            "inductor",
+            "inductor",
+        )
+
+
 def test_sampler_is_not_initialized_outside_compiled_path(monkeypatch):
     import pufferlib.mps_kernels as kernels
 
@@ -265,10 +305,15 @@ def test_fused_sampler_matches_multinomial_rng_and_has_no_allocator_growth():
 def _tensor_digest(tensor):
     if tensor.device.type == "mps":
         torch.mps.synchronize()
-    array = tensor.detach().cpu().contiguous().numpy()
+    cpu_tensor = tensor.detach().cpu().contiguous()
+    array = (
+        cpu_tensor.view(torch.uint8).numpy()
+        if cpu_tensor.dtype == torch.bfloat16
+        else cpu_tensor.numpy()
+    )
     digest = hashlib.sha256()
-    digest.update(str(array.dtype).encode())
-    digest.update(str(array.shape).encode())
+    digest.update(str(cpu_tensor.dtype).encode())
+    digest.update(str(tuple(cpu_tensor.shape)).encode())
     digest.update(memoryview(array))
     return digest.hexdigest()
 
@@ -322,8 +367,9 @@ def _trainer_digest(trainer):
     not _validated_mps_target_available(),
     reason="validated PyTorch MPS target unavailable",
 )
+@pytest.mark.parametrize("amp_dtype", ["float32", "bfloat16"])
 def test_production_fused_sampler_preserves_full_seeded_compiled_epoch(
-        monkeypatch):
+        monkeypatch, amp_dtype):
     if os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK") != "0":
         pytest.skip("requires PYTORCH_ENABLE_MPS_FALLBACK=0 before import")
     from benchmarks.apple_silicon import make_args
@@ -339,7 +385,7 @@ def test_production_fused_sampler_preserves_full_seeded_compiled_epoch(
         torch.manual_seed(1028)
         torch.mps.manual_seed(1028)
         args = make_args(
-            "breakout", 4096, 64, 65_536, "mps", 18, "float32",
+            "breakout", 4096, 64, 65_536, "mps", 18, amp_dtype,
             "auto", "auto")
         device = resolve_device("mps")
         vec = _C.create_vec(args, 0)

@@ -50,6 +50,14 @@ DEFAULT_AGENTS = 4096
 DEFAULT_HORIZON = 64
 DEFAULT_EPOCHS = 32
 DEFAULT_TIMESTEPS = DEFAULT_AGENTS * DEFAULT_HORIZON * DEFAULT_EPOCHS
+MINGRU_METAL_MODES = (
+    "mps_compile_mingru", "mps_compile_ppo_mingru")
+FUSED_PPO_MODES = ("mps_compile_ppo", "mps_compile_ppo_mingru")
+COMPILED_MPS_MODES = (
+    "mps_compile", "mps_compile_bf16", "mps_compile_mingru",
+    *FUSED_PPO_MODES)
+DIRECT_MPS_MODES = ("mps", *COMPILED_MPS_MODES)
+MPS_MODES = ("hybrid", *DIRECT_MPS_MODES)
 
 
 @contextmanager
@@ -74,6 +82,10 @@ def make_args(env_name, mode, *, agents, horizon, minibatch_size,
             "hybrid": ("mps", "cpu"),
             "mps": ("mps", "mps"),
             "mps_compile": ("mps", "mps"),
+            "mps_compile_bf16": ("mps", "mps"),
+            "mps_compile_mingru": ("mps", "mps"),
+            "mps_compile_ppo": ("mps", "mps"),
+            "mps_compile_ppo_mingru": ("mps", "mps"),
             "cuda": ("cuda", "cuda"),
         }[mode]
     except KeyError as exc:
@@ -96,10 +108,19 @@ def make_args(env_name, mode, *, agents, horizon, minibatch_size,
     args["nccl_id"] = b""
     args["torch"]["device"] = training_device
     args["torch"]["rollout_device"] = rollout_device
-    args["torch"]["amp_dtype"] = "float32"
+    args["torch"]["amp_dtype"] = (
+        "bfloat16" if mode == "mps_compile_bf16" else "float32")
     args["torch"]["mps_host_alias"] = mps_host_alias
     args["torch"]["compile_policy"] = (
-        "inductor" if mode == "mps_compile" else "off")
+        "inductor" if mode in COMPILED_MPS_MODES else "off")
+    # Keep the compiler-only and BF16 protocols unchanged. The dedicated PPO
+    # mode is a clean, same-runtime baseline switch for paired learning gates.
+    args["torch"]["compile_ppo"] = (
+        "inductor" if mode in FUSED_PPO_MODES else "off")
+    # Breakout ships auto, so every existing comparison baseline must
+    # explicitly remain off. Dedicated modes isolate the Metal scan.
+    args["torch"]["mingru_train_scan"] = (
+        "metal" if mode in MINGRU_METAL_MODES else "off")
     args["vec"]["total_agents"] = int(agents)
     args["vec"]["num_buffers"] = 1
     args["vec"]["num_threads"] = int(threads)
@@ -136,7 +157,7 @@ def deterministic_algorithms_for_mode(mode, *, require_all=False):
     """Use strict kernels where supported without changing the MPS path."""
     if require_all:
         return True
-    return mode not in ("mps", "mps_compile", "hybrid")
+    return mode not in MPS_MODES
 
 
 def _json_safe(value):
@@ -156,6 +177,74 @@ def _json_safe(value):
 def _finite_losses(losses):
     return bool(losses) and all(
         math.isfinite(float(value)) for value in losses.values())
+
+
+def _iter_tensors(value):
+    if isinstance(value, torch.Tensor):
+        yield value
+    elif isinstance(value, (tuple, list)):
+        for item in value:
+            yield from _iter_tensors(item)
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _iter_tensors(item)
+
+
+def _training_state_health(trainer):
+    """Return fail-closed dtype/finiteness evidence for one completed epoch."""
+    parameters = tuple(trainer.policy.parameters())
+    momentum = tuple(
+        state["momentum_buffer"]
+        for state in trainer.optimizer.state.values()
+        if "momentum_buffer" in state
+    )
+    recurrent = tuple(_iter_tensors(trainer.state))
+    expected_state_dtype = trainer.amp_dtype or torch.float32
+
+    def all_finite(values):
+        values = tuple(values)
+        if not values:
+            return False
+        checks_by_device = {}
+        for value in values:
+            if value.is_floating_point():
+                checks_by_device.setdefault(value.device, []).append(
+                    torch.isfinite(value).all())
+        # Collapse each device's scalar checks before crossing to the host.
+        # This keeps the validation fail-closed without one synchronization per
+        # Parameter or optimizer buffer.
+        return all(
+            bool(torch.stack(checks).all().item())
+            for checks in checks_by_device.values()
+        )
+
+    health = {
+        "parameter_count": len(parameters),
+        "parameters_fp32_finite": (
+            all(value.dtype == torch.float32 for value in parameters)
+            and all_finite(parameters)
+        ),
+        "momentum_buffer_count": len(momentum),
+        "momentum_fp32_finite": (
+            len(momentum) == len(parameters)
+            and all(value.dtype == torch.float32 for value in momentum)
+            and all_finite(momentum)
+        ),
+        "recurrent_tensor_count": len(recurrent),
+        "recurrent_state_dtype_finite": (
+            bool(recurrent)
+            and all(
+                not value.is_floating_point()
+                or value.dtype == expected_state_dtype
+                for value in recurrent
+            )
+            and all_finite(recurrent)
+        ),
+    }
+    health["passed"] = all(
+        value for key, value in health.items()
+        if key.endswith("_finite"))
+    return health
 
 
 def run_one(env_name, mode, seed, *, agents, horizon, minibatch_size,
@@ -203,14 +292,23 @@ def run_one(env_name, mode, seed, *, agents, horizon, minibatch_size,
     synchronize(device)
     synchronize(rollout_device)
     compile_startup_seconds = float(trainer.policy_compile_startup_seconds)
+    mingru_scan_startup_seconds = float(
+        trainer.mingru_train_scan_startup_seconds)
+    ppo_compile_startup_seconds = float(trainer.ppo_compile_startup_seconds)
     sampler_startup_seconds = float(
         trainer.rollout_sampler_startup_seconds)
     optimization_startup_seconds = float(
         trainer.optimization_startup_seconds)
-    # Policy and sampler preflight before the first epoch. Shift the logical
-    # start back so every cold setup cost remains included in uptime, threshold
-    # wall time, full-run wall time, and speedup acceptance.
-    started = time.perf_counter() - optimization_startup_seconds
+    from torch._dynamo.utils import counters
+    counters.clear()
+    # Include cold optimization setup once, then accumulate only synchronized
+    # rollout/train intervals. Numerical health scans deliberately run outside
+    # this clock: otherwise their MPS ``.item()`` synchronizations leak into
+    # every later epoch's cumulative uptime and bias precision comparisons.
+    measured_elapsed = optimization_startup_seconds
+    validation_elapsed = 0.0
+    measured_loop_started = time.perf_counter()
+    measured_loop_wall_seconds = optimization_startup_seconds
     try:
         for epoch in range(1, epochs + 1):
             synchronize(device)
@@ -220,27 +318,50 @@ def run_one(env_name, mode, seed, *, agents, horizon, minibatch_size,
             trainer.train()
             synchronize(device)
             synchronize(rollout_device)
+            # Validation below intentionally runs outside the measured epoch.
+            # It synchronously scans Parameters, Muon momentum, and recurrent
+            # state so numerical damage cannot hide behind finite scalar loss.
+            measured_finished = time.perf_counter()
+            epoch_elapsed = measured_finished - epoch_started
+            measured_elapsed += epoch_elapsed
+            validation_started = time.perf_counter()
 
             losses = {key: float(value) for key, value in trainer.losses.items()}
             if not _finite_losses(losses):
                 raise RuntimeError(
                     f"non-finite training loss in mode={mode} seed={seed}: {losses}")
+            state_health = _training_state_health(trainer)
+            if not state_health["passed"]:
+                raise RuntimeError(
+                    f"invalid training state in mode={mode} seed={seed}: "
+                    f"{state_health}")
             env = dict(trainer.env_logs)
             score = env.get("score")
             episode_count = float(env.get("n", 0.0))
+            validation_seconds = time.perf_counter() - validation_started
+            validation_elapsed += validation_seconds
             records.append({
                 "epoch": epoch,
                 "agent_steps": int(trainer.global_step),
-                "uptime_seconds": time.perf_counter() - started,
-                "epoch_seconds": time.perf_counter() - epoch_started,
+                "uptime_seconds": measured_elapsed,
+                "epoch_seconds": epoch_elapsed,
+                "validation_seconds": validation_seconds,
                 "episode_count": episode_count,
                 "score": None if score is None else float(score),
                 "normalized_score": (
                     None if env.get("perf") is None else float(env["perf"])),
                 "losses": losses,
+                "training_state": state_health,
             })
+        measured_loop_wall_seconds = (
+            optimization_startup_seconds
+            + time.perf_counter() - measured_loop_started)
     finally:
         trainer.close()
+
+    post_preflight_dynamo_frames_total = int(counters["frames"]["total"])
+    post_preflight_dynamo_unique_graphs = int(
+        counters["stats"]["unique_graphs"])
 
     result = {
         "environment": env_name,
@@ -250,6 +371,10 @@ def run_one(env_name, mode, seed, *, agents, horizon, minibatch_size,
         "rollout_device": str(rollout_device),
         "mps_host_alias_io": bool(trainer.mps_host_alias_io),
         "host_horizon_io": bool(trainer.host_horizon_io),
+        "requested_amp_dtype": args["torch"]["amp_dtype"],
+        "effective_amp_dtype": (
+            "float32" if trainer.amp_dtype is None
+            else str(trainer.amp_dtype).removeprefix("torch.")),
         "requested_policy_compile": trainer.policy_compile_requested,
         "effective_policy_compile": trainer.policy_compile_effective,
         "policy_compile_reason": trainer.policy_compile_reason,
@@ -257,13 +382,40 @@ def run_one(env_name, mode, seed, *, agents, horizon, minibatch_size,
         "policy_compile_wrapper_verified": bool(
             trainer.policy_compile_wrapper_verified),
         "policy_compile_startup_seconds": compile_startup_seconds,
+        "requested_mingru_train_scan": trainer.mingru_train_scan_requested,
+        "effective_mingru_train_scan": trainer.mingru_train_scan_effective,
+        "mingru_train_scan_reason": trainer.mingru_train_scan_reason,
+        "mingru_train_scan_preflight": bool(
+            trainer.mingru_train_scan_preflight),
+        "mingru_train_scan_startup_seconds": mingru_scan_startup_seconds,
+        "requested_ppo_compile": trainer.ppo_compile_requested,
+        "effective_ppo_compile": trainer.ppo_compile_effective,
+        "ppo_compile_reason": trainer.ppo_compile_reason,
+        "ppo_compile_preflight": bool(trainer.ppo_compile_preflight),
+        "ppo_compile_wrapper_verified": bool(
+            trainer.ppo_compile_wrapper_verified),
+        "ppo_compile_startup_seconds": ppo_compile_startup_seconds,
         "requested_rollout_sampler": trainer.rollout_sampler_requested,
         "effective_rollout_sampler": trainer.rollout_sampler_effective,
         "rollout_sampler_reason": trainer.rollout_sampler_reason,
         "rollout_sampler_startup_seconds": sampler_startup_seconds,
         "optimization_startup_seconds": optimization_startup_seconds,
+        "post_preflight_dynamo_frames_total":
+            post_preflight_dynamo_frames_total,
+        "post_preflight_dynamo_unique_graphs":
+            post_preflight_dynamo_unique_graphs,
+        "timing_contract": (
+            "total_seconds and epoch/uptime clocks include optimization "
+            "startup plus synchronized rollout/train intervals; numerical "
+            "health scans and report bookkeeping are excluded"),
+        "validation_seconds_total": validation_elapsed,
+        # This includes the complete epoch loop (health checks and reporting)
+        # plus optimization preflight, but intentionally excludes trainer
+        # construction and close. Name the boundary precisely rather than
+        # presenting it as process/full-run wall time.
+        "measured_loop_wall_seconds": measured_loop_wall_seconds,
         "deterministic_algorithms": deterministic_algorithms,
-        "total_seconds": time.perf_counter() - started,
+        "total_seconds": measured_elapsed,
         "effective_config": {
             section: _json_safe(args.get(section, {}))
             for section in ("torch", "train", "vec", "env", "policy")
@@ -364,13 +516,17 @@ def summarize_run(run, *, thresholds=DEFAULT_THRESHOLDS, window_epochs=4,
     final_steps = int(records[-1]["agent_steps"])
     total_seconds = float(run["total_seconds"])
     finite = all(
-        _finite_losses(record.get("losses", {})) for record in records)
+        _finite_losses(record.get("losses", {}))
+        and record.get("training_state", {}).get("passed") is True
+        for record in records)
     return {
         "mode": run["mode"],
         "seed": int(run["seed"]),
         "training_device": run.get("training_device"),
         "rollout_device": run.get("rollout_device"),
         "mps_host_alias_io": bool(run.get("mps_host_alias_io", False)),
+        "requested_amp_dtype": run.get("requested_amp_dtype", "float32"),
+        "effective_amp_dtype": run.get("effective_amp_dtype", "float32"),
         "requested_policy_compile": run.get(
             "requested_policy_compile", "off"),
         "effective_policy_compile": run.get(
@@ -382,6 +538,26 @@ def summarize_run(run, *, thresholds=DEFAULT_THRESHOLDS, window_epochs=4,
             run.get("policy_compile_wrapper_verified", False)),
         "policy_compile_startup_seconds": float(
             run.get("policy_compile_startup_seconds", 0.0)),
+        "requested_mingru_train_scan": run.get(
+            "requested_mingru_train_scan", "off"),
+        "effective_mingru_train_scan": run.get(
+            "effective_mingru_train_scan", "off"),
+        "mingru_train_scan_reason": run.get("mingru_train_scan_reason"),
+        "mingru_train_scan_preflight": bool(
+            run.get("mingru_train_scan_preflight", False)),
+        "mingru_train_scan_startup_seconds": float(
+            run.get("mingru_train_scan_startup_seconds", 0.0)),
+        "requested_ppo_compile": run.get(
+            "requested_ppo_compile", "off"),
+        "effective_ppo_compile": run.get(
+            "effective_ppo_compile", "off"),
+        "ppo_compile_reason": run.get("ppo_compile_reason"),
+        "ppo_compile_preflight": bool(
+            run.get("ppo_compile_preflight", False)),
+        "ppo_compile_wrapper_verified": bool(
+            run.get("ppo_compile_wrapper_verified", False)),
+        "ppo_compile_startup_seconds": float(
+            run.get("ppo_compile_startup_seconds", 0.0)),
         "requested_rollout_sampler": run.get(
             "requested_rollout_sampler", "fused_mps_philox"),
         "effective_rollout_sampler": run.get(
@@ -391,6 +567,15 @@ def summarize_run(run, *, thresholds=DEFAULT_THRESHOLDS, window_epochs=4,
             run.get("rollout_sampler_startup_seconds", 0.0)),
         "optimization_startup_seconds": float(
             run.get("optimization_startup_seconds", 0.0)),
+        "post_preflight_dynamo_frames_total": int(
+            run.get("post_preflight_dynamo_frames_total", 0)),
+        "post_preflight_dynamo_unique_graphs": int(
+            run.get("post_preflight_dynamo_unique_graphs", 0)),
+        "timing_contract": run.get("timing_contract"),
+        "validation_seconds_total": float(
+            run.get("validation_seconds_total", 0.0)),
+        "measured_loop_wall_seconds": float(
+            run.get("measured_loop_wall_seconds", total_seconds)),
         "deterministic_algorithms": bool(
             run.get("deterministic_algorithms", False)),
         "finite": finite,
@@ -458,13 +643,13 @@ def compare_modes(summaries, *, baseline_mode="cpu", candidate_mode="mps",
             "tail_score_ratio": _ratio(cand["tail_score"], base["tail_score"]),
             "mean_score_auc_ratio": _ratio(
                 cand["mean_score_auc"], base["mean_score_auc"]),
-            "wall_time_speedup": _ratio(
+            "measured_training_speedup": _ratio(
                 base["total_seconds"], cand["total_seconds"]),
         })
 
     tail_ratios = [pair["tail_score_ratio"] for pair in paired]
     auc_ratios = [pair["mean_score_auc_ratio"] for pair in paired]
-    speedups = [pair["wall_time_speedup"] for pair in paired]
+    speedups = [pair["measured_training_speedup"] for pair in paired]
     checks = {
         "all_runs_finite": all(pair["finite"] for pair in paired),
         "all_quality_pairs_complete": (
@@ -482,7 +667,7 @@ def compare_modes(summaries, *, baseline_mode="cpu", candidate_mode="mps",
         "mean_score_auc_bootstrap_guard": (
             _bootstrap_median_lower(auc_ratios) is not None
             and _bootstrap_median_lower(auc_ratios) >= float(bootstrap_guard)),
-        "median_wall_time_not_slower": (
+        "median_measured_training_not_slower": (
             _median(speedups) is not None and _median(speedups) >= 1.0),
     }
     if require_candidate_host_alias:
@@ -492,7 +677,7 @@ def compare_modes(summaries, *, baseline_mode="cpu", candidate_mode="mps",
             and candidate[seed].get("mps_host_alias_io") is True
             for seed in seeds
         )
-    if candidate_mode == "mps_compile":
+    if candidate_mode in COMPILED_MPS_MODES:
         checks["candidate_policy_compile_active"] = all(
             candidate[seed].get("requested_policy_compile") == "inductor"
             and candidate[seed].get("effective_policy_compile") == "inductor"
@@ -513,6 +698,59 @@ def compare_modes(summaries, *, baseline_mode="cpu", candidate_mode="mps",
                 "effective_rollout_sampler") == "fused_mps_philox"
             for seed in seeds
         )
+    if candidate_mode == "mps_compile_bf16":
+        checks["candidate_bfloat16_active"] = all(
+            candidate[seed].get("requested_amp_dtype") == "bfloat16"
+            and candidate[seed].get("effective_amp_dtype") == "bfloat16"
+            for seed in seeds
+        )
+    if candidate_mode in MINGRU_METAL_MODES:
+        if baseline_mode not in MINGRU_METAL_MODES:
+            checks["baseline_mingru_train_scan_inactive"] = all(
+                baseline[seed].get("requested_mingru_train_scan") == "off"
+                and baseline[seed].get("effective_mingru_train_scan") == "off"
+                and baseline[seed].get("mingru_train_scan_preflight") is False
+                for seed in seeds
+            )
+        checks["candidate_mingru_train_scan_active"] = all(
+            candidate[seed].get("requested_mingru_train_scan") == "metal"
+            and candidate[seed].get("effective_mingru_train_scan") == "metal"
+            and candidate[seed].get("mingru_train_scan_preflight") is True
+            and candidate[seed].get("requested_amp_dtype") == "float32"
+            and candidate[seed].get("effective_amp_dtype") == "float32"
+            and float(candidate[seed].get(
+                "mingru_train_scan_startup_seconds", 0.0)) > 0.0
+            for seed in seeds
+        )
+        checks["candidate_zero_post_preflight_dynamo_graphs"] = all(
+            int(candidate[seed].get(
+                "post_preflight_dynamo_frames_total", -1)) == 0
+            and int(candidate[seed].get(
+                "post_preflight_dynamo_unique_graphs", -1)) == 0
+            for seed in seeds
+        )
+    if candidate_mode in FUSED_PPO_MODES:
+        if baseline_mode not in FUSED_PPO_MODES:
+            checks["baseline_ppo_compile_inactive"] = all(
+                baseline[seed].get("requested_ppo_compile") == "off"
+                and baseline[seed].get("effective_ppo_compile") == "off"
+                and baseline[seed].get("ppo_compile_preflight") is False
+                and baseline[seed].get(
+                    "ppo_compile_wrapper_verified") is False
+                for seed in seeds
+            )
+        checks["candidate_ppo_compile_active"] = all(
+            candidate[seed].get("requested_ppo_compile") == "inductor"
+            and candidate[seed].get("effective_ppo_compile") == "inductor"
+            and candidate[seed].get("ppo_compile_preflight") is True
+            and candidate[seed].get(
+                "ppo_compile_wrapper_verified") is True
+            and float(candidate[seed].get(
+                "ppo_compile_startup_seconds", 0.0)) > 0.0
+            and candidate[seed].get("requested_amp_dtype") == "float32"
+            and candidate[seed].get("effective_amp_dtype") == "float32"
+            for seed in seeds
+        )
 
     threshold_results = {}
     for threshold in thresholds:
@@ -520,7 +758,7 @@ def compare_modes(summaries, *, baseline_mode="cpu", candidate_mode="mps",
         cpu_reached = []
         candidate_reached = []
         paired_step_ratios = []
-        paired_wall_speedups = []
+        paired_training_speedups = []
         for seed in seeds:
             base_hit = baseline[seed]["time_to_threshold"].get(key)
             cand_hit = candidate[seed]["time_to_threshold"].get(key)
@@ -531,7 +769,7 @@ def compare_modes(summaries, *, baseline_mode="cpu", candidate_mode="mps",
             if base_hit is not None and cand_hit is not None:
                 paired_step_ratios.append(
                     cand_hit["agent_steps"] / base_hit["agent_steps"])
-                paired_wall_speedups.append(
+                paired_training_speedups.append(
                     base_hit["uptime_seconds"] / cand_hit["uptime_seconds"])
 
         # A threshold is a quality gate only when a majority of baseline seeds
@@ -551,7 +789,8 @@ def compare_modes(summaries, *, baseline_mode="cpu", candidate_mode="mps",
             "baseline_reached_seeds": cpu_reached,
             "candidate_reached_seeds": candidate_reached,
             "median_candidate_to_baseline_steps": _median(paired_step_ratios),
-            "median_wall_time_speedup": _median(paired_wall_speedups),
+            "median_measured_training_speedup": _median(
+                paired_training_speedups),
         }
 
     return {
@@ -566,7 +805,7 @@ def compare_modes(summaries, *, baseline_mode="cpu", candidate_mode="mps",
             "median_mean_score_auc_ratio": _median(auc_ratios),
             "mean_score_auc_ratio_bootstrap_90pct_lower": _bootstrap_median_lower(
                 auc_ratios),
-            "median_wall_time_speedup": _median(speedups),
+            "median_measured_training_speedup": _median(speedups),
         },
         "thresholds": threshold_results,
         "acceptance": {
@@ -578,13 +817,20 @@ def compare_modes(summaries, *, baseline_mode="cpu", candidate_mode="mps",
                 "median_steps_to_score_ratio_max": float(max_step_ratio),
                 "threshold_gate_baseline_reach_fraction": "at least half",
                 "allowed_candidate_reach_count_deficit": 1,
-                "median_wall_time_speedup_min": 1.0,
+                "median_measured_training_speedup_min": 1.0,
+                "acceptance_clock": (
+                    "optimization startup plus synchronized rollout/train "
+                    "intervals; numerical validation and bookkeeping excluded"),
                 "candidate_mps_host_alias_required": bool(
                     require_candidate_host_alias),
                 "candidate_policy_compile_required": (
-                    candidate_mode == "mps_compile"),
+                    candidate_mode in COMPILED_MPS_MODES),
                 "candidate_rollout_sampler_required": (
-                    candidate_mode == "mps_compile"),
+                    candidate_mode in COMPILED_MPS_MODES),
+                "candidate_ppo_compile_required": (
+                    candidate_mode in FUSED_PPO_MODES),
+                "candidate_mingru_train_scan_required": (
+                    candidate_mode in MINGRU_METAL_MODES),
             },
         },
     }
@@ -633,7 +879,7 @@ def run_suite(options):
     if compiled_env != options.env:
         raise RuntimeError(
             f"_C was built for {compiled_env!r}, not {options.env!r}")
-    if any(mode in ("mps", "mps_compile", "hybrid")
+    if any(mode in MPS_MODES
             for mode in options.modes):
         if os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK") != "0":
             raise RuntimeError(
@@ -687,10 +933,10 @@ def run_suite(options):
         max_step_ratio=options.max_step_ratio,
         require_candidate_host_alias=(
             options.require_mps_host_alias
-            and options.candidate in ("mps", "mps_compile")),
+            and options.candidate in DIRECT_MPS_MODES),
     )
     return {
-        "schema": "pufferlib-learning-quality-v1",
+        "schema": "pufferlib-learning-quality-v2",
         "environment": options.env,
         "system": _system_metadata(),
         "protocol": {
@@ -709,7 +955,16 @@ def run_suite(options):
             "min_window_episodes": options.min_window_episodes,
             "sustain_epochs": options.sustain_epochs,
             "tail_fraction": options.tail_fraction,
-            "precision": "float32",
+            "precision_by_mode": {
+                mode: (
+                    "bfloat16 autocast"
+                    if mode == "mps_compile_bf16" else "float32")
+                for mode in options.modes
+            },
+            "acceptance_clock": (
+                "optimization startup plus synchronized rollout/train "
+                "intervals; numerical validation and bookkeeping excluded"),
+            "measured_loop_wall_clock_recorded_separately": True,
             "fixed_rng_seeds": True,
             "determinism_policy": (
                 "strict on every mode"
@@ -735,7 +990,10 @@ def _parser():
     parser.add_argument("--env", default="breakout")
     parser.add_argument(
         "--modes", nargs="+",
-        choices=("cpu", "hybrid", "mps", "mps_compile", "cuda"),
+        choices=(
+            "cpu", "hybrid", "mps", "mps_compile",
+            "mps_compile_bf16", "mps_compile_mingru",
+            "mps_compile_ppo", "mps_compile_ppo_mingru", "cuda"),
         default=("cpu", "mps"))
     parser.add_argument("--baseline", default="cpu")
     parser.add_argument("--candidate", default="mps")

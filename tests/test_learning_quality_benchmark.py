@@ -1,7 +1,9 @@
 import importlib.util
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+import torch
 
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -23,6 +25,7 @@ def _record(epoch, score, episodes=1000, seconds=None):
         "score": score,
         "normalized_score": None,
         "losses": {"policy_loss": 0.1, "value_loss": 0.2},
+        "training_state": {"passed": True},
     }
 
 
@@ -71,6 +74,9 @@ def test_summarize_run_reports_tail_auc_and_thresholds():
         "rollout_sampler_reason": "outside exact compiled MPS guard",
         "rollout_sampler_startup_seconds": 0.25,
         "optimization_startup_seconds": 1.5,
+        "timing_contract": "measured training clock",
+        "validation_seconds_total": 0.5,
+        "measured_loop_wall_seconds": 8.5,
     })
     summary = benchmark.summarize_run(
         run,
@@ -91,6 +97,9 @@ def test_summarize_run_reports_tail_auc_and_thresholds():
         "outside exact compiled MPS guard")
     assert summary["rollout_sampler_startup_seconds"] == pytest.approx(0.25)
     assert summary["optimization_startup_seconds"] == pytest.approx(1.5)
+    assert summary["timing_contract"] == "measured training clock"
+    assert summary["validation_seconds_total"] == pytest.approx(0.5)
+    assert summary["measured_loop_wall_seconds"] == pytest.approx(8.5)
 
 
 def test_compare_modes_accepts_equivalent_faster_candidate():
@@ -107,7 +116,7 @@ def test_compare_modes_accepts_equivalent_faster_candidate():
     comparison = benchmark.compare_modes(
         summaries, thresholds=[1], baseline_mode="cpu", candidate_mode="mps")
     assert comparison["acceptance"]["passed"] is True
-    assert comparison["aggregate"]["median_wall_time_speedup"] == 2.0
+    assert comparison["aggregate"]["median_measured_training_speedup"] == 2.0
 
 
 def test_compare_modes_rejects_learning_regression():
@@ -227,6 +236,80 @@ def test_compiled_candidate_cannot_pass_without_fused_rollout_sampler():
         "candidate_rollout_sampler_active"] is False
 
 
+def test_compiled_bfloat16_candidate_cannot_pass_without_effective_amp():
+    summaries = []
+    for seed in benchmark.DEFAULT_SEEDS:
+        baseline = benchmark.summarize_run(
+            _run("mps_compile", seed, [0, 1, 2, 3], seconds=10),
+            thresholds=[1], window_epochs=1, min_window_episodes=1)
+        candidate = benchmark.summarize_run(
+            _run("mps_compile_bf16", seed, [0, 1, 2, 3], seconds=5),
+            thresholds=[1], window_epochs=1, min_window_episodes=1)
+        candidate.update({
+            "training_device": "mps",
+            "rollout_device": "mps",
+            "mps_host_alias_io": True,
+            "requested_amp_dtype": "bfloat16",
+            "effective_amp_dtype": "float32",
+            "requested_policy_compile": "inductor",
+            "effective_policy_compile": "inductor",
+            "policy_compile_preflight": True,
+            "policy_compile_wrapper_verified": True,
+            "policy_compile_startup_seconds": 1.0,
+            "requested_rollout_sampler": "fused_mps_philox",
+            "effective_rollout_sampler": "fused_mps_philox",
+        })
+        summaries.extend((baseline, candidate))
+
+    comparison = benchmark.compare_modes(
+        summaries,
+        thresholds=[1],
+        baseline_mode="mps_compile",
+        candidate_mode="mps_compile_bf16",
+        require_candidate_host_alias=True,
+    )
+    assert comparison["acceptance"]["passed"] is False
+    assert comparison["acceptance"]["checks"][
+        "candidate_bfloat16_active"] is False
+
+
+def test_compiled_bfloat16_candidate_identity_can_pass():
+    summaries = []
+    for seed in benchmark.DEFAULT_SEEDS:
+        baseline = benchmark.summarize_run(
+            _run("mps_compile", seed, [0, 1, 2, 3], seconds=10),
+            thresholds=[1], window_epochs=1, min_window_episodes=1)
+        candidate = benchmark.summarize_run(
+            _run("mps_compile_bf16", seed, [0, 1, 2, 3], seconds=5),
+            thresholds=[1], window_epochs=1, min_window_episodes=1)
+        candidate.update({
+            "training_device": "mps",
+            "rollout_device": "mps",
+            "mps_host_alias_io": True,
+            "requested_amp_dtype": "bfloat16",
+            "effective_amp_dtype": "bfloat16",
+            "requested_policy_compile": "inductor",
+            "effective_policy_compile": "inductor",
+            "policy_compile_preflight": True,
+            "policy_compile_wrapper_verified": True,
+            "policy_compile_startup_seconds": 1.0,
+            "requested_rollout_sampler": "fused_mps_philox",
+            "effective_rollout_sampler": "fused_mps_philox",
+        })
+        summaries.extend((baseline, candidate))
+
+    comparison = benchmark.compare_modes(
+        summaries,
+        thresholds=[1],
+        baseline_mode="mps_compile",
+        candidate_mode="mps_compile_bf16",
+        require_candidate_host_alias=True,
+    )
+    assert comparison["acceptance"]["passed"] is True
+    assert comparison["acceptance"]["checks"][
+        "candidate_bfloat16_active"] is True
+
+
 def test_make_args_preserves_training_hyperparameters_except_shape_and_device():
     args = benchmark.make_args(
         "breakout",
@@ -260,13 +343,40 @@ def test_seed_everything_defaults_to_production_algorithms():
 @pytest.mark.parametrize(
     ("mode", "expected"),
     [("cpu", True), ("cuda", True), ("mps", False),
-     ("mps_compile", False), ("hybrid", False)],
+     ("mps_compile", False), ("mps_compile_bf16", False),
+     ("hybrid", False)],
 )
 def test_deterministic_algorithms_are_enabled_only_on_supported_modes(
         mode, expected):
     assert benchmark.deterministic_algorithms_for_mode(mode) is expected
     assert benchmark.deterministic_algorithms_for_mode(
         mode, require_all=True) is True
+
+
+def test_training_state_health_rejects_parameter_momentum_and_state_damage():
+    policy = torch.nn.Linear(3, 2)
+    momentum = {
+        parameter: {"momentum_buffer": torch.zeros_like(parameter)}
+        for parameter in policy.parameters()
+    }
+    trainer = SimpleNamespace(
+        policy=policy,
+        optimizer=SimpleNamespace(state=momentum),
+        state=(torch.zeros(1, 4, 2),),
+        amp_dtype=None,
+    )
+    assert benchmark._training_state_health(trainer)["passed"] is True
+
+    with torch.no_grad():
+        next(policy.parameters()).flatten()[0] = float("nan")
+    assert benchmark._training_state_health(trainer)["passed"] is False
+    with torch.no_grad():
+        next(policy.parameters()).flatten()[0] = 0.0
+        next(iter(momentum.values()))["momentum_buffer"].flatten()[0] = float("inf")
+    assert benchmark._training_state_health(trainer)["passed"] is False
+    next(iter(momentum.values()))["momentum_buffer"].zero_()
+    trainer.state = (torch.zeros(1, 4, 2, dtype=torch.bfloat16),)
+    assert benchmark._training_state_health(trainer)["passed"] is False
 
 
 @pytest.mark.parametrize("timesteps", [0, benchmark.DEFAULT_TIMESTEPS + 1])
@@ -296,6 +406,22 @@ def test_compiled_mps_mode_uses_guarded_production_compiler():
     assert args["torch"]["device"] == "mps"
     assert args["torch"]["rollout_device"] == "mps"
     assert args["torch"]["compile_policy"] == "inductor"
+
+
+def test_compiled_bfloat16_mode_records_requested_precision():
+    args = benchmark.make_args(
+        "breakout",
+        "mps_compile_bf16",
+        agents=4096,
+        horizon=64,
+        minibatch_size=65536,
+        timesteps=benchmark.DEFAULT_TIMESTEPS,
+        threads=18,
+    )
+    assert args["torch"]["device"] == "mps"
+    assert args["torch"]["rollout_device"] == "mps"
+    assert args["torch"]["compile_policy"] == "inductor"
+    assert args["torch"]["amp_dtype"] == "bfloat16"
 
 
 def test_system_metadata_records_exact_torch_git_revision():

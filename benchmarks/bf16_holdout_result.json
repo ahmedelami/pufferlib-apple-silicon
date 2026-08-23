@@ -1,0 +1,90 @@
+{
+  "schema": "pufferlib-bf16-promotion-result-v1",
+  "recorded_at": "2026-08-23",
+  "decision": "completed_failed",
+  "environment": "breakout",
+  "source_report": {
+    "local_path": "work/current_optimization/bf16_holdout32.json",
+    "sha256": "df7e50bc29de143a90805e8c0ff6943f714f9a8ec1ce05b19c83d9241acdbc40",
+    "schema": "pufferlib-compile-policy-bf16-holdout-v1"
+  },
+  "provenance": {
+    "git_revision": "9c5454013a3b33745adbf2dfd92dd3b3363d57e9",
+    "working_tree_patch_sha256": "20326fe690efc809b908e5345188897b0665ef6cba8b65eefa3de4ffda7a69a9",
+    "torch": "2.13.0",
+    "torch_git_revision": "cf30153c4c131c8164ee7798e5022d810682e2cb",
+    "hardware_model": "Mac17,8",
+    "chip": "Apple M5 Pro",
+    "gpu_model": "Apple M5 Pro",
+    "gpu_cores": 20,
+    "memory_bytes": 25769803776,
+    "macos_version": "27.0",
+    "macos_build": "26A5378j",
+    "pytorch_enable_mps_fallback": "0",
+    "extension_environment": "breakout",
+    "extension_gpu": false,
+    "extension_precision_bytes": 4
+  },
+  "protocol": {
+    "baseline": "compiled FP32",
+    "candidate": "compiled BF16 autocast",
+    "paired_seeds": [127, 131, 137, 139, 149, 151, 157, 163, 167, 173],
+    "replicates": 20,
+    "fresh_process_per_replicate": true,
+    "alternating_pair_order": true,
+    "unique_empty_inductor_cache_per_replicate": true,
+    "agents": 4096,
+    "horizon": 64,
+    "minibatch_size": 65536,
+    "timesteps_per_run": 8388608,
+    "epochs": 32,
+    "environment_threads": 18,
+    "torch_threads": 12,
+    "torch_interop_threads": 1,
+    "all_runs_finite": true,
+    "all_candidate_runs_verified_compiled_bf16_fused_sampler_alias": true
+  },
+  "acceptance": {
+    "passed": false,
+    "criteria": {
+      "median_quality_ratio_min": 0.95,
+      "bootstrap_90pct_lower_guard_min": 0.9,
+      "median_steps_to_score_ratio_max": 1.05,
+      "median_measured_training_speedup_min": 1.0,
+      "allowed_candidate_reach_count_deficit": 1
+    },
+    "checks": {
+      "all_quality_pairs_complete": true,
+      "all_runs_finite": true,
+      "candidate_bfloat16_active": true,
+      "candidate_mps_host_alias_active": true,
+      "candidate_policy_compile_active": true,
+      "candidate_rollout_sampler_active": true,
+      "mean_score_auc_bootstrap_guard": true,
+      "median_mean_score_auc_ratio": true,
+      "median_tail_score_ratio": true,
+      "median_measured_training_not_slower": true,
+      "tail_score_bootstrap_guard": false,
+      "threshold_2.0_reach_coverage": true,
+      "threshold_2.0_step_equivalence": true,
+      "threshold_4.0_reach_coverage": true,
+      "threshold_4.0_step_equivalence": false
+    }
+  },
+  "metrics": {
+    "median_tail_score_ratio": 1.015155976619464,
+    "tail_score_ratio_bootstrap_90pct_lower": 0.8992735631317081,
+    "median_mean_score_auc_ratio": 0.999670099866738,
+    "mean_score_auc_ratio_bootstrap_90pct_lower": 0.9730302857006079,
+    "median_measured_training_speedup": 1.101012715780954,
+    "score_2_median_candidate_to_baseline_steps": 1.0,
+    "score_4_median_candidate_to_baseline_steps": 1.0555555555555556,
+    "score_2_reach_count": "10/10 in both modes",
+    "score_4_reach_count": "10/10 in both modes"
+  },
+  "failure_reasons": [
+    "tail-score bootstrap lower bound 0.8992735631 was below the preregistered 0.90 floor",
+    "score-4 median step ratio 1.0555555556 exceeded the preregistered 1.05 ceiling"
+  ],
+  "policy": "BF16 remains an explicit experimental opt-in. These observed seeds cannot be rerun to reverse the promotion decision, and no production-length BF16 promotion profile is enabled."
+}

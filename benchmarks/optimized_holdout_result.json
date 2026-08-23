@@ -1,0 +1,167 @@
+{
+  "schema": "pufferlib-final-m5-optimization-holdout-result-v1",
+  "recorded_at": "2026-08-23",
+  "completion_status": "completed_failed",
+  "promotion_eligible": false,
+  "environment": "breakout",
+  "source_report": {
+    "local_path": "work/optimized_holdout.json",
+    "sha256": "c7bbdcfc3d00e527a693c94e1a5dc47d7499db9ab6a9d9046dc9b0b270b69873",
+    "size_bytes": 4654098,
+    "schema": "pufferlib-final-m5-optimization-holdout-v1"
+  },
+  "protocol": {
+    "local_path": "benchmarks/optimized_holdout_protocol.json",
+    "sha256": "fd7f562c84594a6126501e636d136a0182ce357160ddef1c62ecf88362be25eb",
+    "paired_seeds": [233, 239, 241, 251, 257],
+    "paired_seed_count": 5,
+    "complete_run_count": 10,
+    "complete_runs_per_mode": 5,
+    "epochs_per_run": 358,
+    "complete_steps_per_run": 93847552,
+    "complete_steps_all_runs": 938475520,
+    "baseline_mode": "mps_compile",
+    "candidate_mode": "mps_compile_ppo_mingru"
+  },
+  "provenance": {
+    "git_revision": "9c5454013a3b33745adbf2dfd92dd3b3363d57e9",
+    "working_tree_patch": {
+      "schema": "pufferlib-working-tree-patch-v2",
+      "algorithm": "sha256",
+      "digest": "e3f34edec47f3cafe69ac398f7b9b9c6ca9ad465e229ad9fd6b3151e91766372",
+      "tracked_patch_bytes": 135746,
+      "untracked_files": 10,
+      "untracked_bytes": 123812,
+      "unreadable_files": 0
+    },
+    "torch": "2.13.0",
+    "torch_git_revision": "cf30153c4c131c8164ee7798e5022d810682e2cb",
+    "hardware_model": "Mac17,8",
+    "chip": "Apple M5 Pro",
+    "gpu_model": "Apple M5 Pro",
+    "gpu_cores": 20,
+    "memory_bytes": 25769803776,
+    "macos_version": "27.0",
+    "macos_build": "26A5378j",
+    "pytorch_enable_mps_fallback": "0",
+    "torch_threads": 12,
+    "torch_interop_threads": 1,
+    "extension_environment": "breakout",
+    "extension_gpu": false,
+    "extension_precision_bytes": 4
+  },
+  "execution_identity": {
+    "paired_configuration_identity_passed": true,
+    "allowed_torch_differences": ["compile_ppo", "mingru_train_scan"],
+    "complete_run_identity_pass_count": 10,
+    "finite_run_count": 10,
+    "candidate_exact_optimized_identity_pass_count": 5,
+    "post_preflight_dynamo_frames_total_max": 0,
+    "post_preflight_dynamo_unique_graphs_max": 0
+  },
+  "aggregate": {
+    "median_tail_score_ratio": 0.9866352620279571,
+    "tail_score_ratio_bootstrap_90pct_lower": 0.6509477851013946,
+    "median_learning_auc_ratio": 0.6750937501695325,
+    "learning_auc_ratio_bootstrap_90pct_lower": 0.5350861015559203,
+    "median_measured_training_speedup": 1.2904060800726649
+  },
+  "thresholds": {
+    "2.0": {
+      "gated": true,
+      "baseline_reach_count": 5,
+      "candidate_reach_count": 5,
+      "baseline_reached_seeds": [233, 239, 241, 251, 257],
+      "candidate_reached_seeds": [233, 239, 241, 251, 257],
+      "median_candidate_to_baseline_steps": 1.0,
+      "median_measured_training_speedup": 0.940854589673246
+    },
+    "4.0": {
+      "gated": true,
+      "baseline_reach_count": 5,
+      "candidate_reach_count": 5,
+      "baseline_reached_seeds": [233, 239, 241, 251, 257],
+      "candidate_reached_seeds": [233, 239, 241, 251, 257],
+      "median_candidate_to_baseline_steps": 1.0769230769230769,
+      "median_measured_training_speedup": 0.9614952639125022
+    }
+  },
+  "acceptance": {
+    "passed": false,
+    "criteria": {
+      "median_tail_score_ratio_min": 0.95,
+      "tail_score_bootstrap_90pct_lower_min": 0.9,
+      "median_learning_auc_ratio_min": 0.95,
+      "learning_auc_bootstrap_90pct_lower_min": 0.9,
+      "median_steps_to_score_ratio_max": 1.05,
+      "allowed_candidate_reach_count_deficit": 1,
+      "median_measured_training_speedup_min": 1.0,
+      "all_runs_finite": true,
+      "all_candidate_runs_must_verify_exact_compiler_sampler_ppo_scan_identity": true,
+      "candidate_must_show_zero_post_preflight_dynamo_graphs": true
+    },
+    "checks": {
+      "all_baseline_and_candidate_identities": true,
+      "all_candidate_exact_optimized_identity": true,
+      "all_runs_finite": true,
+      "candidate_zero_post_preflight_dynamo_graphs": true,
+      "established_analyzer_acceptance": false,
+      "learning_auc_bootstrap_90pct_lower": false,
+      "median_learning_auc_ratio": false,
+      "median_measured_training_speedup": true,
+      "median_steps_to_score_ratio": false,
+      "median_tail_score_ratio": true,
+      "tail_score_bootstrap_90pct_lower": false,
+      "threshold_reach_deficit": true
+    },
+    "passed_checks": [
+      "all_baseline_and_candidate_identities",
+      "all_candidate_exact_optimized_identity",
+      "all_runs_finite",
+      "candidate_zero_post_preflight_dynamo_graphs",
+      "median_measured_training_speedup",
+      "median_tail_score_ratio",
+      "threshold_reach_deficit"
+    ],
+    "failed_checks": [
+      "established_analyzer_acceptance",
+      "learning_auc_bootstrap_90pct_lower",
+      "median_learning_auc_ratio",
+      "median_steps_to_score_ratio",
+      "tail_score_bootstrap_90pct_lower"
+    ]
+  },
+  "analyzer_acceptance": {
+    "passed": false,
+    "passed_checks": [
+      "all_quality_pairs_complete",
+      "all_runs_finite",
+      "baseline_mingru_train_scan_inactive",
+      "baseline_ppo_compile_inactive",
+      "candidate_mingru_train_scan_active",
+      "candidate_mps_host_alias_active",
+      "candidate_policy_compile_active",
+      "candidate_ppo_compile_active",
+      "candidate_rollout_sampler_active",
+      "candidate_zero_post_preflight_dynamo_graphs",
+      "median_measured_training_not_slower",
+      "median_tail_score_ratio",
+      "threshold_2.0_reach_coverage",
+      "threshold_2.0_step_equivalence",
+      "threshold_4.0_reach_coverage"
+    ],
+    "failed_checks": [
+      "mean_score_auc_bootstrap_guard",
+      "median_mean_score_auc_ratio",
+      "tail_score_bootstrap_guard",
+      "threshold_4.0_step_equivalence"
+    ]
+  },
+  "failure_reasons": [
+    "learning-AUC median ratio 0.6750937502 was below the preregistered 0.95 floor",
+    "learning-AUC bootstrap lower bound 0.5350861016 was below the preregistered 0.90 floor",
+    "tail-score bootstrap lower bound 0.6509477851 was below the preregistered 0.90 floor",
+    "score-4 median step ratio 1.0769230769 exceeded the preregistered 1.05 ceiling"
+  ],
+  "decision": "The combined PPO-compiler plus Metal-MinGRU candidate is not promoted. The five now-observed paired seeds cannot be rerun to reverse this decision."
+}

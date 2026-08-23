@@ -45,7 +45,8 @@ _REPO_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 
 
 def make_args(env_name, agents, horizon, minibatch_size, mode, threads,
-        amp_dtype, mps_host_alias='auto', compile_policy='off'):
+        amp_dtype, mps_host_alias='auto', compile_policy='off',
+        compile_ppo='off', mingru_train_scan='off'):
     with clean_argv():
         args = load_config(env_name)
     training_device, rollout_device = {
@@ -63,6 +64,8 @@ def make_args(env_name, agents, horizon, minibatch_size, mode, threads,
     args['torch']['amp_dtype'] = amp_dtype
     args['torch']['mps_host_alias'] = mps_host_alias
     args['torch']['compile_policy'] = compile_policy
+    args['torch']['compile_ppo'] = compile_ppo
+    args['torch']['mingru_train_scan'] = mingru_train_scan
     args['vec']['total_agents'] = agents
     args['vec']['num_buffers'] = 1
     args['vec']['num_threads'] = threads
@@ -76,12 +79,14 @@ def make_args(env_name, agents, horizon, minibatch_size, mode, threads,
 
 def run_mode(env_name, mode, agents, horizon, minibatch_size,
         threads, warmup_epochs, epochs, seed, amp_dtype='float32',
-        mps_host_alias='auto', compile_policy='off'):
+        mps_host_alias='auto', compile_policy='off', compile_ppo='off',
+        mingru_train_scan='off'):
     torch.manual_seed(seed)
     np.random.seed(seed)
     effective_amp_dtype = 'float32' if mode == 'cpu' else amp_dtype
     args = make_args(env_name, agents, horizon, minibatch_size,
-        mode, threads, effective_amp_dtype, mps_host_alias, compile_policy)
+        mode, threads, effective_amp_dtype, mps_host_alias, compile_policy,
+        compile_ppo, mingru_train_scan)
     device = resolve_device(args['torch']['device'], native_cuda=False)
     vec = _C.create_vec(args, 0)
     trainer = None
@@ -96,6 +101,9 @@ def run_mode(env_name, mode, agents, horizon, minibatch_size,
             trainer.train()
         synchronize(device)
         synchronize(rollout_device)
+
+        from torch._dynamo.utils import counters
+        counters.clear()
 
         rollout_seconds = []
         train_seconds = []
@@ -118,13 +126,17 @@ def run_mode(env_name, mode, agents, horizon, minibatch_size,
         if not all(torch.isfinite(param).all().item()
                 for param in trainer.policy.parameters()):
             raise RuntimeError(f'non-finite policy parameter in {mode}')
+        post_preflight_dynamo_frames_total = int(
+            counters['frames']['total'])
+        post_preflight_dynamo_unique_graphs = int(
+            counters['stats']['unique_graphs'])
     finally:
         if trainer is None:
             vec.close()
         else:
             trainer.close()
 
-    return _summarize_run(
+    result = _summarize_run(
         mode=mode,
         device=device,
         rollout_device=rollout_device,
@@ -142,6 +154,13 @@ def run_mode(env_name, mode, agents, horizon, minibatch_size,
         rollout_seconds=rollout_seconds,
         train_seconds=train_seconds,
     )
+    result.update({
+        'post_preflight_dynamo_frames_total':
+            post_preflight_dynamo_frames_total,
+        'post_preflight_dynamo_unique_graphs':
+            post_preflight_dynamo_unique_graphs,
+    })
+    return result
 
 
 def _json_safe(value):
@@ -205,6 +224,28 @@ def _summarize_run(*, mode, device, rollout_device, trainer, args, agents,
             trainer, 'policy_compile_wrapper_verified', False)),
         'policy_compile_startup_seconds': float(getattr(
             trainer, 'policy_compile_startup_seconds', 0.0)),
+        'requested_mingru_train_scan': getattr(
+            trainer, 'mingru_train_scan_requested', 'off'),
+        'effective_mingru_train_scan': getattr(
+            trainer, 'mingru_train_scan_effective', 'off'),
+        'mingru_train_scan_reason': getattr(
+            trainer, 'mingru_train_scan_reason', None),
+        'mingru_train_scan_preflight': bool(getattr(
+            trainer, 'mingru_train_scan_preflight', False)),
+        'mingru_train_scan_startup_seconds': float(getattr(
+            trainer, 'mingru_train_scan_startup_seconds', 0.0)),
+        'requested_ppo_compile': getattr(
+            trainer, 'ppo_compile_requested', 'off'),
+        'effective_ppo_compile': getattr(
+            trainer, 'ppo_compile_effective', 'off'),
+        'ppo_compile_reason': getattr(
+            trainer, 'ppo_compile_reason', None),
+        'ppo_compile_preflight': bool(getattr(
+            trainer, 'ppo_compile_preflight', False)),
+        'ppo_compile_wrapper_verified': bool(getattr(
+            trainer, 'ppo_compile_wrapper_verified', False)),
+        'ppo_compile_startup_seconds': float(getattr(
+            trainer, 'ppo_compile_startup_seconds', 0.0)),
         'requested_rollout_sampler': getattr(
             trainer, 'rollout_sampler_requested', 'torch_multinomial'),
         'effective_rollout_sampler': getattr(
@@ -479,6 +520,10 @@ def main():
         default='auto', help='request Apple unified-memory rollout aliasing')
     parser.add_argument('--compile-policy', choices=['off', 'auto', 'inductor'],
         default='off', help='guarded policy compiler mode')
+    parser.add_argument('--compile-ppo', choices=['off', 'auto', 'inductor'],
+        default='off', help='guarded FP32 policy + PPO compiler mode')
+    parser.add_argument('--mingru-train-scan', choices=['off', 'auto', 'metal'],
+        default='off', help='guarded FP32 training-only Metal MinGRU scan')
     parser.add_argument('--modes', nargs='+', choices=['cpu', 'hybrid', 'mps', 'cuda'],
         default=['cpu', 'hybrid', 'mps'])
     options = parser.parse_args()
@@ -509,7 +554,8 @@ def main():
                 options.env, mode, agents, options.horizon, minibatch_size,
                 options.threads, options.warmup_epochs, options.epochs,
                 options.seed, options.amp_dtype, options.mps_host_alias,
-                options.compile_policy)
+                options.compile_policy, options.compile_ppo,
+                options.mingru_train_scan)
             results.append(result)
             print(json.dumps(result, sort_keys=True), flush=True)
 

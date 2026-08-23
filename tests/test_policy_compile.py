@@ -86,8 +86,9 @@ def _mock_validated_host_and_geometry(monkeypatch):
     )
 
 
+@pytest.mark.parametrize("amp_dtype", [None, torch.bfloat16])
 def test_validated_policy_compile_preserves_parameters_and_passes_options(
-        monkeypatch):
+        monkeypatch, amp_dtype):
     monkeypatch.setenv("PYTORCH_ENABLE_MPS_FALLBACK", "0")
     _mock_validated_host_and_geometry(monkeypatch)
     monkeypatch.setattr(
@@ -109,11 +110,15 @@ def test_validated_policy_compile_preserves_parameters_and_passes_options(
 
     requested, effective, reason, startup, preflight = (
         torch_pufferl.configure_policy_compile(
-            _args(), _vec(), policy, "mps", "mps", None, True, _state()))
+            _args(), _vec(), policy, "mps", "mps", amp_dtype, True,
+            _state()))
 
     assert requested == "inductor"
     assert effective == "inductor"
-    assert "validated Breakout" in reason
+    expected_precision = (
+        "execution-contract verified experimental BF16 autocast"
+        if amp_dtype is torch.bfloat16 else "validated Breakout FP32")
+    assert expected_precision in reason
     assert "Dynamo wrappers verified" in reason
     assert startup == 0.25
     assert preflight is True
@@ -150,6 +155,38 @@ def test_policy_compile_auto_falls_back_outside_validated_shape(monkeypatch):
     assert "total_agents is not 4096" in reason
     assert startup == 0.25
     assert preflight is False
+
+
+def test_policy_compile_rejects_persistent_cross_horizon_state(monkeypatch):
+    monkeypatch.setenv("PYTORCH_ENABLE_MPS_FALLBACK", "0")
+    _mock_validated_host_and_geometry(monkeypatch)
+    monkeypatch.setattr(
+        torch,
+        "compile",
+        lambda *args, **kwargs: pytest.fail("compiler should not be called"),
+    )
+    args = _args("auto")
+    args["reset_state"] = False
+    elapsed = iter((11.5, 11.75, 12.0))
+    monkeypatch.setattr(
+        torch_pufferl.time, "perf_counter", lambda: next(elapsed))
+
+    requested, effective, reason, startup, preflight = (
+        torch_pufferl.configure_policy_compile(
+            args, _vec(), _policy(), "mps", "mps", None, True,
+            _state()))
+
+    assert requested == "auto"
+    assert effective == "off"
+    assert "persistent cross-horizon recurrent state is unvalidated" in reason
+    assert startup == 0.25
+    assert preflight is False
+
+    args["torch"]["compile_policy"] = "inductor"
+    with pytest.raises(ValueError, match="persistent cross-horizon"):
+        torch_pufferl.configure_policy_compile(
+            args, _vec(), _policy(), "mps", "mps", None, True,
+            _state())
 
 
 def test_policy_compile_auto_stays_eager_on_other_apple_hardware(monkeypatch):
@@ -190,6 +227,16 @@ def test_explicit_policy_compile_fails_closed_outside_validated_shape(
     with pytest.raises(ValueError, match="horizon is not 64"):
         torch_pufferl.configure_policy_compile(
             args, _vec(), _policy(), "mps", "mps", None, True, _state())
+
+
+def test_explicit_policy_compile_rejects_float16_amp(monkeypatch):
+    monkeypatch.setenv("PYTORCH_ENABLE_MPS_FALLBACK", "0")
+    _mock_validated_host_and_geometry(monkeypatch)
+
+    with pytest.raises(ValueError, match="AMP dtype is not float32 or bfloat16"):
+        torch_pufferl.configure_policy_compile(
+            _args(), _vec(), _policy(), "mps", "mps", torch.float16,
+            True, _state())
 
 
 def test_policy_compile_setup_failure_does_not_half_mutate_policy(monkeypatch):
@@ -421,10 +468,13 @@ def test_actual_policy_geometry_rejects_instance_method_override():
         in mismatches)
 
 
-def test_policy_compile_preflight_preserves_policy_state_and_rng():
+@pytest.mark.parametrize("amp_dtype", [None, torch.bfloat16])
+def test_policy_compile_preflight_preserves_policy_state_and_rng(amp_dtype):
     policy = _policy()
     policy.train(False)
     state = _state()
+    if amp_dtype is not None:
+        state = tuple(value.to(amp_dtype) for value in state)
     parameters = {
         name: value.detach().clone()
         for name, value in policy.named_parameters()
@@ -442,6 +492,7 @@ def test_policy_compile_preflight_preserves_policy_state_and_rng():
         64,
         65_536,
         118,
+        amp_dtype,
     )
 
     assert policy.training is False
@@ -453,7 +504,29 @@ def test_policy_compile_preflight_preserves_policy_state_and_rng():
     assert all(value.grad is None for value in policy.parameters())
 
 
-def test_production_policy_compile_executes_one_mps_epoch(tmp_path):
+def test_policy_compile_preflight_rejects_wrong_recurrent_state_dtype():
+    policy = _policy()
+
+    with pytest.raises(RuntimeError, match="recurrent-state"):
+        torch_pufferl._preflight_policy_compile(
+            policy.forward_eval,
+            policy.forward,
+            policy,
+            _state(),
+            "cpu",
+            4096,
+            64,
+            65_536,
+            118,
+            torch.bfloat16,
+        )
+
+    assert all(value.grad is None for value in policy.parameters())
+
+
+@pytest.mark.parametrize("amp_dtype", ["float32", "bfloat16"])
+def test_production_policy_compile_executes_one_mps_epoch(
+        tmp_path, amp_dtype):
     if not torch.backends.mps.is_available():
         pytest.skip("MPS is unavailable")
     if not hasattr(torch.mps, "_host_alias_storage"):
@@ -475,7 +548,7 @@ def test_production_policy_compile_executes_one_mps_epoch(tmp_path):
     args["gpu_id"] = 0
     args["torch"]["device"] = "mps"
     args["torch"]["rollout_device"] = "mps"
-    args["torch"]["amp_dtype"] = "float32"
+    args["torch"]["amp_dtype"] = amp_dtype
     args["torch"]["mps_host_alias"] = "on"
     args["torch"]["compile_policy"] = "inductor"
     args["vec"]["total_agents"] = 4096
@@ -502,14 +575,26 @@ def test_production_policy_compile_executes_one_mps_epoch(tmp_path):
         assert trainer.policy_compile_preflight is True
         assert trainer.policy_compile_wrapper_verified is True
         assert trainer.policy_compile_startup_seconds > 0.0
+        assert trainer.rollout_sampler_effective == "fused_mps_philox"
+        expected_policy_dtype = (
+            torch.bfloat16 if amp_dtype == "bfloat16" else torch.float32)
+        assert all(parameter.dtype == torch.float32
+            for parameter in trainer.policy.parameters())
+        assert all(value.dtype == expected_policy_dtype
+            for value in torch_pufferl._state_tensors(trainer.state))
         assert tuple(trainer.policy.state_dict()) == state_keys
         assert [id(param) for param in trainer.policy.parameters()] == parameter_ids
         checkpoint_clone = _policy().to("mps")
         checkpoint_clone.load_state_dict(trainer.policy.state_dict(), strict=True)
         checkpoint_path = tmp_path / "compiled-policy.pt"
         trainer.save_weights(checkpoint_path)
+        from torch._dynamo.utils import counters
+        counters.clear()
         trainer.rollouts()
         trainer.train()
+        torch.mps.synchronize()
+        assert counters["frames"]["total"] == 0
+        assert counters["stats"]["unique_graphs"] == 0
         assert all(math.isfinite(float(value)) for value in trainer.losses.values())
         assert all(torch.isfinite(param).all() for param in trainer.policy.parameters())
         assert any(not torch.equal(value, checkpoint_clone.state_dict()[name])
@@ -521,12 +606,31 @@ def test_production_policy_compile_executes_one_mps_epoch(tmp_path):
             for name, value in trainer.policy.state_dict().items())
         observations = torch.zeros(4096, 118, device="mps")
         state = checkpoint_clone.initial_state(4096, device="mps")
-        with torch.no_grad():
+        if trainer.amp_dtype is not None:
+            state = torch_pufferl._map_state(
+                state,
+                lambda value: value.to(trainer.amp_dtype)
+                    if value.is_floating_point() else value,
+            )
+        with torch.no_grad(), trainer._autocast("mps"):
             compiled_output = trainer.policy.forward_eval(observations, state)
             eager_output = checkpoint_clone.forward_eval(observations, state)
-        for compiled, eager in zip(
-                torch_pufferl._state_tensors(compiled_output),
-                torch_pufferl._state_tensors(eager_output)):
-            torch.testing.assert_close(compiled, eager, rtol=2e-6, atol=2e-5)
+            compiled_second = trainer.policy.forward_eval(
+                observations, compiled_output[2])
+            eager_second = checkpoint_clone.forward_eval(
+                observations, eager_output[2])
+        assert all(value.dtype == expected_policy_dtype
+            for value in torch_pufferl._state_tensors(compiled_output))
+        assert all(value.dtype == expected_policy_dtype
+            for value in torch_pufferl._state_tensors(compiled_second))
+        tolerance = 2e-2 if amp_dtype == "bfloat16" else 2e-5
+        for compiled_result, eager_result in (
+                (compiled_output, eager_output),
+                (compiled_second, eager_second)):
+            for compiled, eager in zip(
+                    torch_pufferl._state_tensors(compiled_result),
+                    torch_pufferl._state_tensors(eager_result)):
+                torch.testing.assert_close(
+                    compiled, eager, rtol=tolerance, atol=tolerance)
     finally:
         trainer.close()
