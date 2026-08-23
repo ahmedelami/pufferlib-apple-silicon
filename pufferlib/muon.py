@@ -20,7 +20,6 @@ NS_COEFS = [
 ]
  
 def zeropower_via_newtonschulz5(G, eps=1e-7):
-    G = G.clone()
     x = G
     if G.size(-2) > G.size(-1):
         x = x.mT
@@ -122,14 +121,15 @@ class Muon(Optimizer):
                 buf = muon_momentum_bufs[i]
                 buf.mul_(momentum)
                 buf.add_(grad)
-                grad.add_(buf*momentum)
+                grad.add_(buf, alpha=momentum)
 
                 if grad.ndim >= 2:
                     grad = grad.view(grad.shape[0], -1)
                     grad = zeropower_via_newtonschulz5(grad) # original has hardcoded steps and eps
                     grad *= max(1, grad.size(-2) / grad.size(-1)) ** 0.5 # Matches heavyball and Keller
 
-                param.mul_(1 - lr * weight_decay)
-                param.sub_(lr*grad.view(param.shape))
+                if weight_decay != 0:
+                    param.mul_(1 - lr * weight_decay)
+                param.add_(grad.view(param.shape), alpha=-lr)
 
         return loss

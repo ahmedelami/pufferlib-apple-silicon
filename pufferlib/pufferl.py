@@ -12,6 +12,8 @@ import ast
 import time
 import argparse
 import configparser
+import queue
+import socket
 from collections import defaultdict
 import multiprocessing as mp
 from copy import deepcopy
@@ -172,7 +174,10 @@ def _resolve_backend(args):
     compiled_env = getattr(_C, 'env_name', None)
     assert compiled_env is None or compiled_env == args['env_name'], \
         f'build.sh was run for {compiled_env}, not {args["env_name"]}'
-    if args.get('slowly'):
+    # CPU native extensions provide the vectorized simulator but not the
+    # monolithic CUDA trainer. Select the portable Torch trainer automatically
+    # so Apple Silicon and explicit --cpu builds work without a hidden flag.
+    if args.get('slowly') or not hasattr(_C, 'create_pufferl'):
         from pufferlib.torch_pufferl import PuffeRL
         return PuffeRL
     return _C
@@ -181,18 +186,40 @@ def _train_worker(args):
     backend = _resolve_backend(args)
     pufferl = backend.create_pufferl(args)
     args.pop('nccl_id', None)
-    while pufferl.global_step < args['train']['total_timesteps']:
-        backend.rollouts(pufferl)
-        backend.train(pufferl)
+    try:
+        while pufferl.global_step < args['train']['total_timesteps']:
+            backend.rollouts(pufferl)
+            backend.train(pufferl)
+    finally:
+        backend.close(pufferl)
 
-    backend.close(pufferl)
+def _sync_stop_decision(pufferl, requested, world_size):
+    """Broadcast rank zero's stop decision when the Torch process group exists.
+
+    The monolithic native backend owns a separate NCCL communicator that is not
+    exposed to Python. Early stopping is therefore disabled for its multi-GPU
+    runs so every rank executes the same fixed number of collectives.
+    """
+    if world_size <= 1:
+        return bool(requested)
+    if not (torch.distributed.is_available()
+            and torch.distributed.is_initialized()):
+        return False
+    flag = torch.tensor(
+        [int(bool(requested))], dtype=torch.int32, device=pufferl.device)
+    torch.distributed.broadcast(flag, src=0)
+    return bool(flag.item())
+
 
 def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
-    '''Single-GPU training worker. Process target for both DDP ranks and sweep trials.'''
+    '''One training rank. Launch supervision and rank coordination live above.'''
     backend = _resolve_backend(args)
-    rank = args['rank']
+    rank = int(args['rank'])
+    world_size = int(args.get('world_size', 1))
+    primary = rank == 0
+    track_wandb = bool(args['wandb'] and primary)
     run_id = str(int(1000*time.time()))
-    if args['wandb']:
+    if track_wandb:
         import wandb
         run_id = wandb.util.generate_id()
         wandb.init(id=run_id, config=args,
@@ -204,211 +231,331 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
     target_key = f'env/{args["sweep"]["metric"]}'
     total_timesteps = args['train']['total_timesteps']
     all_logs = []
-
-    # When sweeping, optionally score each trial by winrate vs a fixed enemy
-    # checkpoint (match mode) instead of the training-time self-play metric.
     match_mode = (sweep_obj is not None
         and bool(args.get('sweep', {}).get('match_enemy_model_path')))
 
-    checkpoint_dir = os.path.join(args['checkpoint_dir'], args['env_name'], run_id)
-    os.makedirs(checkpoint_dir, exist_ok=True)
-
+    checkpoint_dir = os.path.join(
+        args['checkpoint_dir'], args['env_name'], run_id)
     log_dir = os.path.join(args['log_dir'], args['env_name'])
-    os.makedirs(log_dir, exist_ok=True)
+    if primary:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        os.makedirs(log_dir, exist_ok=True)
 
     try:
         pufferl = backend.create_pufferl(args)
-    except RuntimeError as e:
-        print(f'WARNING: {e}, skipping')
-        if result_queue is not None:
+    except RuntimeError as exc:
+        if track_wandb:
+            wandb.run.finish(exit_code=1)
+        # A single-device sweep can turn setup failures into failed proposals.
+        # Multi-rank and direct launches must fail nonzero so their supervisor
+        # or torchrun can terminate peers instead of reporting false success.
+        if result_queue is not None and world_size == 1:
+            print(f'WARNING: {exc}, skipping')
             result_queue.put((args['gpu_id'], [], [], []))
-        return
+            return
+        raise
 
     args.pop('nccl_id', None)
     model_size = pufferl.num_params()
     if verbose:
-        flat_logs = dict(unroll_nested_dict(backend.log(pufferl)))
-        print_dashboard(args, model_size, flat_logs, clear=True)
+        initial_logs = dict(unroll_nested_dict(backend.log(pufferl)))
+        print_dashboard(args, model_size, initial_logs, clear=True)
 
-    # Selfplay-pool curriculum (no-op unless selfplay.enabled). Disabled
-    # under match-mode sweeps since match() owns its own perm/frozen bank.
-    pool_state = None
     try:
         pool_state = selfplay.setup(pufferl, backend, args, run_id)
-    except RuntimeError as e:
-        print(f'WARNING: {e}, skipping')
+    except RuntimeError as exc:
         backend.close(pufferl)
-        if result_queue is not None:
+        if track_wandb:
+            wandb.run.finish(exit_code=1)
+        if result_queue is not None and world_size == 1:
+            print(f'WARNING: {exc}, skipping')
             result_queue.put((args['gpu_id'], [], [], []))
-        return
+            return
+        raise
 
     model_path = ''
     flat_logs = {}
-    train_epochs = int(total_timesteps // (args['vec']['total_agents'] * args['train']['horizon']))
+    train_epochs = int(total_timesteps // (
+        args['vec']['total_agents'] * args['train']['horizon']))
     eval_epochs = train_epochs // 2
-    for epoch in range(train_epochs + eval_epochs):
-        backend.rollouts(pufferl)
+    try:
+        for epoch in range(train_epochs + eval_epochs):
+            backend.rollouts(pufferl)
+            if epoch < train_epochs:
+                backend.train(pufferl)
 
-        if epoch < train_epochs:
-            backend.train(pufferl)
+            is_final = epoch == train_epochs - 1
+            should_save = primary and (
+                (sweep_obj is None and (
+                    epoch % args['checkpoint_interval'] == 0 or is_final))
+                or (match_mode and is_final))
+            if should_save:
+                model_path = os.path.join(
+                    checkpoint_dir, f'{pufferl.global_step:016d}.bin')
+                backend.save_weights(pufferl, model_path)
 
-        # In match-sweep mode we need the final checkpoint to feed into match().
-        is_final = epoch == train_epochs - 1
-        should_save = (sweep_obj is None
-            and (epoch % args['checkpoint_interval'] == 0 or is_final)
-        ) or (match_mode and is_final)
-        if should_save:
-            model_path = os.path.join(checkpoint_dir, f'{pufferl.global_step:016d}.bin')
-            backend.save_weights(pufferl, model_path)
+            # Multi-rank workers must all reach the stop broadcast. Retain the
+            # old dashboard rate limit only for single-device runs.
+            if (world_size == 1
+                    and time.time() < pufferl.last_log_time + 0.6
+                    and epoch < train_epochs - 1):
+                continue
 
-        # Rate limit, but always log for eval to maintain determinism
-        if time.time() < pufferl.last_log_time + 0.6 and epoch < train_epochs - 1:
-            continue
+            logs = (backend.eval_log(pufferl)
+                if epoch >= train_epochs else backend.log(pufferl))
+            flat_logs = {**flat_logs, **dict(unroll_nested_dict(logs))}
+            if epoch < train_epochs:
+                selfplay.step(pufferl, backend, pool_state, flat_logs, epoch)
+            if verbose:
+                print_dashboard(args, model_size, flat_logs)
 
-        logs = backend.eval_log(pufferl) if epoch >= train_epochs else backend.log(pufferl)
-        flat_logs = {**flat_logs, **dict(unroll_nested_dict(logs))}
+            requested_stop = False
+            if target_key in flat_logs:
+                if track_wandb:
+                    wandb.log(flat_logs, step=flat_logs['agent_steps'])
+                if epoch < train_epochs:
+                    if primary:
+                        all_logs.append(flat_logs)
+                    requested_stop = bool(primary and sweep_obj is not None
+                        and pufferl.global_step > min(
+                            0.20*total_timesteps, 100_000_000)
+                        and sweep_obj.early_stop(logs, target_key))
+                else:
+                    requested_stop = bool(
+                        primary and flat_logs['env/n'] > args['eval_episodes'])
 
-        if epoch < train_epochs:
-            selfplay.step(pufferl, backend, pool_state, flat_logs, epoch)
+            if _sync_stop_decision(pufferl, requested_stop, world_size):
+                break
 
         if verbose:
             print_dashboard(args, model_size, flat_logs)
+        if primary and match_mode and not model_path:
+            model_path = os.path.join(
+                checkpoint_dir, f'{pufferl.global_step:016d}.bin')
+            backend.save_weights(pufferl, model_path)
+        if (torch.distributed.is_available()
+                and torch.distributed.is_initialized()):
+            torch.distributed.barrier()
+    finally:
+        backend.close(pufferl)
 
-        if target_key not in flat_logs:
-            continue
-
-        if args['wandb']:
-            wandb.log(flat_logs, step=flat_logs['agent_steps'])
-
-        if epoch < train_epochs:
-            all_logs.append(flat_logs)
-
-            if (sweep_obj is not None
-                    and pufferl.global_step > min(0.20*total_timesteps, 100_000_000) and
-                    sweep_obj.early_stop(logs, target_key)):
-                break
-        elif flat_logs['env/n'] > args['eval_episodes']:
-            break
-
-
-    print_dashboard(args, model_size, flat_logs)
-    # Match-mode trials may have early-stopped before the in-loop save fired;
-    # ensure we always have a checkpoint to feed match().
-    if match_mode and not model_path:
-        model_path = os.path.join(checkpoint_dir, f'{pufferl.global_step:016d}.bin')
-        backend.save_weights(pufferl, model_path)
-    backend.close(pufferl)
-
+    # Only rank zero owns checkpoints, reporting, W&B, and sweep results.
+    if not primary:
+        return
     if target_key not in flat_logs:
+        if track_wandb:
+            wandb.run.finish(exit_code=1)
         if result_queue is not None:
             result_queue.put((args['gpu_id'], None, None, None))
         return
 
-    # Match-mode scoring: primary = trained policy (model_path); frozen bank =
-    # fixed enemy. Score is slot 0's average winrate. Creates its own pufferl
-    # so must run after the training instance is closed. Single observation per
-    # trial (mid-training curve doesn't predict final match score).
     match_score = None
     if match_mode:
         sweep_cfg = args['sweep']
         match_args = deepcopy(args)
-        match_args['enemy_hidden_size'] = int(sweep_cfg['match_enemy_hidden_size'])
-        match_args['enemy_num_layers'] = int(sweep_cfg['match_enemy_num_layers'])
+        match_args['rank'] = 0
+        match_args['world_size'] = 1
+        match_args['nccl_id'] = b''
+        match_args.pop('torch_dist_init_method', None)
+        match_args['enemy_hidden_size'] = int(
+            sweep_cfg['match_enemy_hidden_size'])
+        match_args['enemy_num_layers'] = int(
+            sweep_cfg['match_enemy_num_layers'])
         match_logs = match(env_name,
             policy_a_path=model_path,
             policy_b_path=sweep_cfg['match_enemy_model_path'],
             num_games=int(sweep_cfg['match_num_games']),
             args=match_args, verbose=verbose)
         match_score = float(match_logs['env/slot_0_score'])
-        if args['wandb']:
-            wandb.log({'env/match_score': match_score}, step=flat_logs['agent_steps'])
+        if track_wandb:
+            wandb.log({'env/match_score': match_score},
+                step=flat_logs['agent_steps'])
 
-    # This version has the training perf logs and eval env logs
     all_logs.append(flat_logs)
-
-    # Downsample results
     n = args['sweep']['downsample']
-    metrics = {k: [[]] for k in all_logs[0]}
+    metrics = {key: [[]] for key in all_logs[0]}
     logged_timesteps = all_logs[-1]['agent_steps']
     next_bin = logged_timesteps / (n - 1) if n > 1 else np.inf
     for log in all_logs:
-        for k, v in log.items():
-            metrics[k][-1].append(v)
-
+        for key, value in log.items():
+            metrics[key][-1].append(value)
         if log['agent_steps'] < next_bin:
             continue
-
         next_bin += logged_timesteps / (n - 1)
-        for k in metrics:
-            metrics[k][-1] = np.mean(metrics[k][-1])
-            metrics[k].append([])
-
-    for k in metrics:
-        metrics[k][-1] = all_logs[-1][k]
-
-    # Match-mode: single observation at final-training cost. Protein's curve
-    # fit collapses to one point — we only trust the match winrate, not any
-    # training-time proxy. Replicate the scalar across all downsample bins so
-    # the JSON log shape matches every other metric (cache_data.py rejects
-    # length-mismatched metrics as "bad data").
+        for key in metrics:
+            metrics[key][-1] = np.mean(metrics[key][-1])
+            metrics[key].append([])
+    for key in metrics:
+        metrics[key][-1] = all_logs[-1][key]
     if match_mode:
-        metrics['env/match_score'] = [match_score] * len(metrics['agent_steps'])
+        metrics['env/match_score'] = [
+            match_score] * len(metrics['agent_steps'])
 
-    # Save own log: config + downsampled results
-    log_dir = os.path.join(args['log_dir'], args['env_name'])
     os.makedirs(log_dir, exist_ok=True)
-    with open(os.path.join(log_dir, run_id + '.json'), 'w') as f:
-        json.dump({**args, 'metrics': metrics}, f)
+    with open(os.path.join(log_dir, run_id + '.json'), 'w') as output:
+        json.dump({**args, 'metrics': metrics}, output)
 
-    if args['wandb']:
-        if sweep_obj is None and model_path: # Don't spam uploads during sweeps
+    if track_wandb:
+        if sweep_obj is None and model_path:
             artifact = wandb.Artifact(run_id, type='model')
             artifact.add_file(model_path)
             wandb.run.log_artifact(artifact)
-
         wandb.run.finish()
 
     if result_queue is not None:
         if match_mode:
-            # One observation: final hypers -> match winrate, at total training cost.
             result_queue.put((args['gpu_id'], [match_score],
                 [metrics['uptime'][-1]], [metrics['agent_steps'][-1]]))
         else:
-            result_queue.put((args['gpu_id'], metrics['env/score'], metrics['uptime'], metrics['agent_steps']))
+            result_queue.put((args['gpu_id'], metrics['env/score'],
+                metrics['uptime'], metrics['agent_steps']))
+
+def _torchrun_context(environ=None):
+    """Return torchrun's process coordinates, or None outside torchrun."""
+    environ = os.environ if environ is None else environ
+    names = ('RANK', 'WORLD_SIZE', 'LOCAL_RANK')
+    if not all(name in environ for name in names):
+        return None
+    return tuple(int(environ[name]) for name in names)
+
+
+def _local_torch_rendezvous():
+    """Reserve a localhost endpoint for one internally spawned Torch job."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(('127.0.0.1', 0))
+        port = sock.getsockname()[1]
+    return f'tcp://127.0.0.1:{port}'
+
+
+def _supervise_train_group(env_name, args, gpus, worker_kwargs,
+        verbose_primary=False):
+    """Run all ranks as children, terminate peers on failure, and join them."""
+    ctx = mp.get_context('spawn')
+    external_queue = worker_kwargs.get('result_queue')
+    result_bridge = ctx.Queue() if external_queue is not None else None
+    processes = []
+    for rank, gpu_id in reversed(list(enumerate(gpus))):
+        rank_args = deepcopy(args)
+        rank_args['rank'] = rank
+        rank_args['gpu_id'] = gpu_id
+        rank_kwargs = dict(worker_kwargs)
+        rank_kwargs['verbose'] = bool(verbose_primary and rank == 0)
+        rank_kwargs['result_queue'] = (
+            result_bridge if rank == 0 else None)
+        process = ctx.Process(
+            target=_train, args=(env_name, rank_args), kwargs=rank_kwargs)
+        process.start()
+        processes.append(process)
+
+    failed = None
+    while any(process.exitcode is None for process in processes):
+        failed = next((process for process in processes
+            if process.exitcode not in (None, 0)), None)
+        if failed is not None:
+            for process in processes:
+                if process.is_alive():
+                    process.terminate()
+            break
+        time.sleep(0.05)
+
+    for process in processes:
+        process.join()
+    failures = [process for process in processes if process.exitcode != 0]
+    if failures:
+        if external_queue is not None:
+            external_queue.put((gpus[0], [], [], []))
+        codes = [process.exitcode for process in failures]
+        raise RuntimeError(
+            f'training rank failure(s), exit codes: {codes}')
+
+    if external_queue is not None:
+        try:
+            result = result_bridge.get(timeout=10)
+        except queue.Empty:
+            result = (gpus[0], [], [], [])
+        external_queue.put(result)
+
 
 def train(env_name, args=None, gpus=None, **kwargs):
     args = args or load_config(env_name)
     validate_config(args)
 
+    torch_backend = bool(
+        args.get('slowly') or not hasattr(_C, 'create_pufferl'))
+    torchrun = _torchrun_context()
+    if torchrun is not None:
+        if not torch_backend:
+            raise RuntimeError(
+                'torchrun is supported by the portable Torch backend; '
+                'pass --slowly or use puffer train for the native CUDA backend')
+        rank, world_size, local_rank = torchrun
+        if world_size < 1 or not 0 <= rank < world_size:
+            raise ValueError('invalid RANK/WORLD_SIZE supplied by torchrun')
+        args['rank'] = rank
+        args['world_size'] = world_size
+        args['gpu_id'] = local_rank
+        args['train']['gpus'] = world_size
+        args['train']['total_timesteps'] //= world_size
+        args['nccl_id'] = b''
+        _train(env_name, args, verbose=(rank == 0), **kwargs)
+        return
+
     subprocess = gpus is not None
     gpus = list(gpus or range(args['train']['gpus']))
+    if not gpus:
+        raise ValueError('training requires at least one device')
     args['train']['total_timesteps'] //= len(gpus)
     args['world_size'] = len(gpus)
-    args['nccl_id'] = _C.get_nccl_id() if len(gpus) > 1 else b''
-
-    if not subprocess:
-        gpus = gpus[-1:] + gpus[:-1]  # Main process gets rank 0
+    if torch_backend:
+        args['nccl_id'] = b''
+        if len(gpus) > 1:
+            args['torch_dist_init_method'] = _local_torch_rendezvous()
+    else:
+        args['nccl_id'] = _C.get_nccl_id() if len(gpus) > 1 else b''
 
     ctx = mp.get_context('spawn')
-    for rank, gpu_id in reversed(list(enumerate(gpus))):
-        worker_args = deepcopy(args)
-        worker_args['rank'] = rank
-        worker_args['gpu_id'] = gpu_id
-        if rank == 0 and not subprocess:
-            _train(env_name, worker_args, verbose=True)
-        else:
-            # Protein's GP models live on cuda:0 on non-WSL setups; spawn-pickling
-            # them works fine via CUDA IPC. On WSL, sweep.py forces device='cpu'
-            # at construction so there's nothing to move.
-            ctx.Process(target=_train, args=(env_name, worker_args),
-                kwargs=kwargs).start()
+    if subprocess:
+        supervisor = ctx.Process(
+            target=_supervise_train_group,
+            args=(env_name, args, gpus, kwargs, False))
+        supervisor.start()
+        return supervisor
+    if len(gpus) > 1:
+        return _supervise_train_group(
+            env_name, args, gpus, kwargs, verbose_primary=True)
+
+    worker_args = deepcopy(args)
+    worker_args['rank'] = 0
+    worker_args['gpu_id'] = gpus[0]
+    return _train(env_name, worker_args, verbose=True, **kwargs)
+
+def _sweep_device_count(sweep_config):
+    configured = int(sweep_config.get('gpus', 0))
+    if configured < 0:
+        raise ValueError('sweep.gpus must be non-negative')
+    if configured:
+        return configured
+
+    if torch.cuda.is_available():
+        return max(1, torch.cuda.device_count())
+    if torch.backends.mps.is_available():
+        return 1
+
+    # CPU sweeps are slow but valid, and keeping one worker also makes config
+    # validation portable to machines without /proc or an accelerator.
+    return 1
 
 def sweep(env_name, args=None, pareto=False):
     '''Train entry point. Handles single-GPU, multi-GPU DDP, and sweeps.'''
     args = args or load_config(env_name)
     exp_gpus = args['train']['gpus']
-    sweep_gpus = args['sweep']['gpus'] or len(os.listdir('/proc/driver/nvidia/gpus'))
-    args['vec']['num_threads'] //= (sweep_gpus // exp_gpus)
+    sweep_gpus = _sweep_device_count(args['sweep'])
+    parallel_runs = sweep_gpus // exp_gpus
+    if exp_gpus < 1 or parallel_runs < 1:
+        raise ValueError(
+            f'train.gpus={exp_gpus} cannot fit in {sweep_gpus} sweep device(s)')
+    args['vec']['num_threads'] = max(
+        1, args['vec']['num_threads'] // parallel_runs)
     args['no_model_upload'] = True
 
     sweep_config = args['sweep']
@@ -502,6 +649,10 @@ def match(env_name, policy_a_path, policy_b_path, num_games=4096, args=None, ver
     args = args or load_config(env_name)
     args['reset_state'] = False
     args['train']['horizon'] = 1
+    match_max_ticks = args.get('match_max_ticks') or args.get(
+        'sweep', {}).get('match_max_ticks')
+    if match_max_ticks:
+        args['env']['max_ticks'] = int(match_max_ticks)
     args.setdefault('nccl_id', b'')  # match is always single-GPU
     # Sweep suggestions can give odd agents_per_buffer (e.g. num_buffers=5,
     # total_agents=4096 -> 819). Pin to a stable eval config that guarantees
