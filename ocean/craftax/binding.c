@@ -25,7 +25,7 @@ void craftax_vec_step(StaticVec* vec) {
     memset(vec->terminals, 0, vec->total_agents * sizeof(float));
     Craftax* envs = (Craftax*)vec->envs;
     int size = vec->size;
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(static) num_threads(vec->num_threads)
     for (int tile = 0; tile < size; tile += CRAFTAX_VEC_TILE_SIZE) {
         int end = tile + CRAFTAX_VEC_TILE_SIZE;
         if (end > size) end = size;
@@ -37,9 +37,9 @@ void craftax_vec_step(StaticVec* vec) {
 }
 
 void craftax_vec_step_range(StaticVec* vec, int env_start, int env_count, int num_workers) {
-    (void)num_workers;
     Craftax* envs = (Craftax*)vec->envs;
     int env_end = env_start + env_count;
+    #pragma omp parallel for schedule(static) num_threads(num_workers)
     for (int tile = env_start; tile < env_end; tile += CRAFTAX_VEC_TILE_SIZE) {
         int end = tile + CRAFTAX_VEC_TILE_SIZE;
         if (end > env_end) end = env_end;
@@ -65,6 +65,14 @@ Env* my_vec_init(
     int num_buffers = (int)dict_get(vec_kwargs, "num_buffers")->value;
     int agents_per_buffer = total_agents / num_buffers;
     int num_envs = total_agents;
+
+    int reset_pool_size = 0;
+    DictItem* pool_item = dict_get_unsafe(env_kwargs, "reset_pool_size");
+    if (pool_item != NULL) reset_pool_size = (int)pool_item->value;
+    if (!craftax_set_reset_pool_size(reset_pool_size)) {
+        *num_envs_out = 0;
+        return NULL;
+    }
 
     Env* envs = (Env*)calloc((size_t)num_envs, sizeof(Env));
     CraftaxArena* arena = (CraftaxArena*)calloc(1, sizeof(CraftaxArena));
@@ -122,13 +130,6 @@ void my_init(Env* env, Dict* kwargs) {
         seed_offset = (uint64_t)item->value;
     }
     env->seed = seed_offset + (uint64_t)env->rng;
-
-    // Process-wide reset pool (first caller wins, rest block until ready).
-    // 0 disables caching -- regenerate every reset (exact parity mode).
-    int reset_pool_size = 0;
-    DictItem* pool_item = dict_get_unsafe(kwargs, "reset_pool_size");
-    if (pool_item != NULL) reset_pool_size = (int)pool_item->value;
-    craftax_set_reset_pool_size(reset_pool_size);
 
     c_init(env);
 }

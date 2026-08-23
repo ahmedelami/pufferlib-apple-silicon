@@ -9,6 +9,7 @@
 
 #include "worldgen.h"
 #include "raylib.h"
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
@@ -659,15 +660,42 @@ static inline void craftax_reset_state_from_reset_key(
 static int g_craftax_reset_pool_size = 0;
 static CraftaxState* g_craftax_reset_pool = NULL;
 static int g_craftax_reset_pool_ready = 0;
+static pthread_mutex_t g_craftax_reset_pool_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-// Called from my_init which runs single-threaded during env creation
-// (vecenv.h iterates envs sequentially). First caller populates the
-// pool; subsequent callers are no-ops.
-static inline void craftax_set_reset_pool_size(int n) {
-    if (g_craftax_reset_pool_ready) return;
+// The pool is process-wide. Reusing the same setting is safe, but silently
+// accepting a different setting would make an exact reset_pool_size=0 vector
+// inherit approximate pooled resets (or ignore a requested optimization).
+// Return false so the Python binding can fail vector creation explicitly.
+static inline bool craftax_set_reset_pool_size(int n) {
+    if (n < 0) {
+        fprintf(stderr, "Craftax reset_pool_size must be non-negative\n");
+        return false;
+    }
+
+    pthread_mutex_lock(&g_craftax_reset_pool_mutex);
+    if (g_craftax_reset_pool_ready) {
+        bool matches = n == g_craftax_reset_pool_size;
+        if (!matches) {
+            fprintf(
+                stderr,
+                "Craftax reset_pool_size is process-wide: already %d, requested %d\n",
+                g_craftax_reset_pool_size,
+                n
+            );
+        }
+        pthread_mutex_unlock(&g_craftax_reset_pool_mutex);
+        return matches;
+    }
+
     g_craftax_reset_pool_size = n;
     if (n > 0) {
         g_craftax_reset_pool = (CraftaxState*)calloc((size_t)n, sizeof(CraftaxState));
+        if (g_craftax_reset_pool == NULL) {
+            g_craftax_reset_pool_size = 0;
+            pthread_mutex_unlock(&g_craftax_reset_pool_mutex);
+            fprintf(stderr, "Craftax reset pool allocation failed\n");
+            return false;
+        }
         for (int i = 0; i < n; i++) {
             CraftaxThreefryKey init_key = craftax_prng_key((uint32_t)i);
             CraftaxThreefryKey discard, reset_key;
@@ -676,6 +704,8 @@ static inline void craftax_set_reset_pool_size(int n) {
         }
     }
     g_craftax_reset_pool_ready = 1;
+    pthread_mutex_unlock(&g_craftax_reset_pool_mutex);
+    return true;
 }
 
 static inline void craftax_ensure_state_storage(Craftax* env) {

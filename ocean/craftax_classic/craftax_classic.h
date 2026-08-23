@@ -28,7 +28,12 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <math.h>
+#if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
+#define CRAFTAX_CLASSIC_X86_64 1
+#else
+#define CRAFTAX_CLASSIC_X86_64 0
+#endif
 #include "raylib.h"
 
 // ============================================================
@@ -280,13 +285,127 @@ static inline int get_damage(const CraftaxClassic* s) {
 }
 
 // ============================================================
-// Perlin worldgen (AVX-512, per-env)
+// Perlin worldgen. AVX-512 remains available on capable x86 hosts, while the
+// scalar loop is portable and auto-vectorizes to NEON on Apple Silicon.
 // ============================================================
 static inline float perlin_interp(float t) { return t*t*t*(t*(t*6.0f-15.0f)+10.0f); }
 
-#if defined(__clang__) || defined(__GNUC__)
+#define CRAFTAX_PERLIN_GRID 10
+#define CRAFTAX_PERLIN_GRID_PAD (CRAFTAX_PERLIN_GRID * CRAFTAX_PERLIN_GRID + 16)
+
+static void generate_perlin_noise_scalar(
+        const float cos_a[4][CRAFTAX_PERLIN_GRID_PAD],
+        const float sin_a[4][CRAFTAX_PERLIN_GRID_PAD],
+        float inv_scale,
+        float noise[4][MAP_SIZE][MAP_SIZE]) {
+    for (int r = 0; r < MAP_SIZE; r++) {
+        float nr = (float)r * inv_scale;
+        int x0 = (int)nr;
+        float fx = nr - (float)x0;
+        float fx1 = fx - 1.0f;
+        float u = perlin_interp(fx);
+        int row0 = x0 * CRAFTAX_PERLIN_GRID;
+        int row1 = row0 + CRAFTAX_PERLIN_GRID;
+
+        for (int c = 0; c < MAP_SIZE; c++) {
+            float nc = (float)c * inv_scale;
+            int y0 = (int)nc;
+            int y1 = y0 + 1;
+            float fy = nc - (float)y0;
+            float fy1 = fy - 1.0f;
+            float v = perlin_interp(fy);
+
+            for (int k = 0; k < 4; k++) {
+                float n00 = cos_a[k][row0 + y0] * fx
+                          + sin_a[k][row0 + y0] * fy;
+                float n10 = cos_a[k][row1 + y0] * fx1
+                          + sin_a[k][row1 + y0] * fy;
+                float n01 = cos_a[k][row0 + y1] * fx
+                          + sin_a[k][row0 + y1] * fy1;
+                float n11 = cos_a[k][row1 + y1] * fx1
+                          + sin_a[k][row1 + y1] * fy1;
+                float nx0 = u * (n10 - n00) + n00;
+                float nx1 = u * (n11 - n01) + n01;
+                float n = v * (nx1 - nx0) + nx0;
+                noise[k][r][c] = (n + 1.0f) * 0.5f;
+            }
+        }
+    }
+}
+
+#if CRAFTAX_CLASSIC_X86_64 && (defined(__clang__) || defined(__GNUC__))
 __attribute__((target("avx512f,avx512bw,avx512dq,avx512vl")))
+static void generate_perlin_noise_avx512(
+        const float cos_a[4][CRAFTAX_PERLIN_GRID_PAD],
+        const float sin_a[4][CRAFTAX_PERLIN_GRID_PAD],
+        float inv_scale,
+        float noise[4][MAP_SIZE][MAP_SIZE]) {
+    const __m512 c_lane = _mm512_setr_ps(0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15);
+    const __m512 one    = _mm512_set1_ps(1.0f);
+    const __m512 half   = _mm512_set1_ps(0.5f);
+    const __m512 c6     = _mm512_set1_ps(6.0f);
+    const __m512 c15    = _mm512_set1_ps(15.0f);
+    const __m512 c10    = _mm512_set1_ps(10.0f);
+    const __m512 invs   = _mm512_set1_ps(inv_scale);
+    const __m512i i_one = _mm512_set1_epi32(1);
+
+    for (int r = 0; r < MAP_SIZE; r++) {
+        float nr = (float)r * inv_scale;
+        int x0 = (int)nr;
+        float fx = nr - x0;
+        float fx1 = fx - 1.0f;
+        float u = perlin_interp(fx);
+        int row0 = x0 * CRAFTAX_PERLIN_GRID;
+        int row1 = row0 + CRAFTAX_PERLIN_GRID;
+        __m512 fx_v  = _mm512_set1_ps(fx);
+        __m512 fx1_v = _mm512_set1_ps(fx1);
+        __m512 u_v   = _mm512_set1_ps(u);
+
+        for (int c_base = 0; c_base < MAP_SIZE; c_base += 16) {
+            __m512 c_v  = _mm512_add_ps(_mm512_set1_ps((float)c_base), c_lane);
+            __m512 nc_v = _mm512_mul_ps(c_v, invs);
+            __m512i y0_v = _mm512_cvttps_epi32(nc_v);
+            __m512 y0_f = _mm512_cvtepi32_ps(y0_v);
+            __m512 fy_v  = _mm512_sub_ps(nc_v, y0_f);
+            __m512 fy1_v = _mm512_sub_ps(fy_v, one);
+            __m512 t = _mm512_fmsub_ps(fy_v, c6, c15);
+            t = _mm512_fmadd_ps(fy_v, t, c10);
+            __m512 fy2 = _mm512_mul_ps(fy_v, fy_v);
+            __m512 fy3 = _mm512_mul_ps(fy2, fy_v);
+            __m512 v_v = _mm512_mul_ps(fy3, t);
+            __m512i y1_v = _mm512_add_epi32(y0_v, i_one);
+
+            for (int k = 0; k < 4; k++) {
+                __m512 cos_r0 = _mm512_loadu_ps(&cos_a[k][row0]);
+                __m512 cos_r1 = _mm512_loadu_ps(&cos_a[k][row1]);
+                __m512 sin_r0 = _mm512_loadu_ps(&sin_a[k][row0]);
+                __m512 sin_r1 = _mm512_loadu_ps(&sin_a[k][row1]);
+
+                __m512 c00 = _mm512_permutexvar_ps(y0_v, cos_r0);
+                __m512 c10v= _mm512_permutexvar_ps(y0_v, cos_r1);
+                __m512 c01 = _mm512_permutexvar_ps(y1_v, cos_r0);
+                __m512 c11 = _mm512_permutexvar_ps(y1_v, cos_r1);
+                __m512 s00 = _mm512_permutexvar_ps(y0_v, sin_r0);
+                __m512 s10 = _mm512_permutexvar_ps(y0_v, sin_r1);
+                __m512 s01 = _mm512_permutexvar_ps(y1_v, sin_r0);
+                __m512 s11 = _mm512_permutexvar_ps(y1_v, sin_r1);
+
+                __m512 n00 = _mm512_fmadd_ps(c00,  fx_v,  _mm512_mul_ps(s00, fy_v));
+                __m512 n10 = _mm512_fmadd_ps(c10v, fx1_v, _mm512_mul_ps(s10, fy_v));
+                __m512 n01 = _mm512_fmadd_ps(c01,  fx_v,  _mm512_mul_ps(s01, fy1_v));
+                __m512 n11 = _mm512_fmadd_ps(c11,  fx1_v, _mm512_mul_ps(s11, fy1_v));
+
+                __m512 nx0 = _mm512_fmadd_ps(u_v, _mm512_sub_ps(n10, n00), n00);
+                __m512 nx1 = _mm512_fmadd_ps(u_v, _mm512_sub_ps(n11, n01), n01);
+                __m512 n = _mm512_fmadd_ps(v_v, _mm512_sub_ps(nx1, nx0), nx0);
+                n = _mm512_mul_ps(_mm512_add_ps(n, one), half);
+                _mm512_storeu_ps(&noise[k][r][c_base], n);
+            }
+        }
+    }
+}
 #endif
+
 static void generate_world(CraftaxClassic* s) {
     // Reset maps and bitmaps
     for (int i = 0; i < MAP_PACKED_SIZE; i++)
@@ -300,88 +419,35 @@ static void generate_world(CraftaxClassic* s) {
     // Perlin gradient tables (precompute cos/sin of the per-grid random angles).
     // Padded by +16 floats so AVX-512 permute-load at the last grid row doesn't
     // read out of bounds.
-    enum { GRID = 10, GRID_PAD = GRID * GRID + 16 };
-    _Alignas(64) float cos_a[4][GRID_PAD];
-    _Alignas(64) float sin_a[4][GRID_PAD];
+    _Alignas(64) float cos_a[4][CRAFTAX_PERLIN_GRID_PAD];
+    _Alignas(64) float sin_a[4][CRAFTAX_PERLIN_GRID_PAD];
     for (int layer = 0; layer < 4; layer++) {
-        for (int i = 0; i < GRID * GRID; i++) {
+        for (int i = 0; i < CRAFTAX_PERLIN_GRID * CRAFTAX_PERLIN_GRID; i++) {
             float a = cr_rf(&s->pcg) * 2.0f * 3.14159265f;
             cos_a[layer][i] = cosf(a);
             sin_a[layer][i] = sinf(a);
         }
-        for (int i = GRID * GRID; i < GRID_PAD; i++) { cos_a[layer][i] = 0; sin_a[layer][i] = 0; }
+        for (int i = CRAFTAX_PERLIN_GRID * CRAFTAX_PERLIN_GRID;
+                i < CRAFTAX_PERLIN_GRID_PAD; i++) {
+            cos_a[layer][i] = 0;
+            sin_a[layer][i] = 0;
+        }
     }
 
-    float scale = (float)MAP_SIZE / (float)(GRID - 1);
+    float scale = (float)MAP_SIZE / (float)(CRAFTAX_PERLIN_GRID - 1);
     float inv_scale = 1.0f / scale;
     int center = MAP_SIZE / 2;
 
     _Alignas(64) float noise[4][MAP_SIZE][MAP_SIZE];
-    {
-        const __m512 c_lane = _mm512_setr_ps(0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15);
-        const __m512 one    = _mm512_set1_ps(1.0f);
-        const __m512 half   = _mm512_set1_ps(0.5f);
-        const __m512 c6     = _mm512_set1_ps(6.0f);
-        const __m512 c15    = _mm512_set1_ps(15.0f);
-        const __m512 c10    = _mm512_set1_ps(10.0f);
-        const __m512 invs   = _mm512_set1_ps(inv_scale);
-        const __m512i i_one = _mm512_set1_epi32(1);
-
-        for (int r = 0; r < MAP_SIZE; r++) {
-            float nr = (float)r * inv_scale;
-            int x0 = (int)nr;
-            float fx = nr - x0;
-            float fx1 = fx - 1.0f;
-            float u = perlin_interp(fx);
-            int row0 = x0 * GRID, row1 = row0 + GRID;
-            __m512 fx_v  = _mm512_set1_ps(fx);
-            __m512 fx1_v = _mm512_set1_ps(fx1);
-            __m512 u_v   = _mm512_set1_ps(u);
-
-            for (int c_base = 0; c_base < MAP_SIZE; c_base += 16) {
-                __m512 c_v  = _mm512_add_ps(_mm512_set1_ps((float)c_base), c_lane);
-                __m512 nc_v = _mm512_mul_ps(c_v, invs);
-                __m512i y0_v = _mm512_cvttps_epi32(nc_v);
-                __m512 y0_f = _mm512_cvtepi32_ps(y0_v);
-                __m512 fy_v  = _mm512_sub_ps(nc_v, y0_f);
-                __m512 fy1_v = _mm512_sub_ps(fy_v, one);
-                __m512 t = _mm512_fmsub_ps(fy_v, c6, c15);
-                t = _mm512_fmadd_ps(fy_v, t, c10);
-                __m512 fy2 = _mm512_mul_ps(fy_v, fy_v);
-                __m512 fy3 = _mm512_mul_ps(fy2, fy_v);
-                __m512 v_v = _mm512_mul_ps(fy3, t);
-                __m512i y1_v = _mm512_add_epi32(y0_v, i_one);
-
-                for (int k = 0; k < 4; k++) {
-                    __m512 cos_r0 = _mm512_loadu_ps(&cos_a[k][row0]);
-                    __m512 cos_r1 = _mm512_loadu_ps(&cos_a[k][row1]);
-                    __m512 sin_r0 = _mm512_loadu_ps(&sin_a[k][row0]);
-                    __m512 sin_r1 = _mm512_loadu_ps(&sin_a[k][row1]);
-
-                    __m512 c00 = _mm512_permutexvar_ps(y0_v, cos_r0);
-                    __m512 c10v= _mm512_permutexvar_ps(y0_v, cos_r1);
-                    __m512 c01 = _mm512_permutexvar_ps(y1_v, cos_r0);
-                    __m512 c11 = _mm512_permutexvar_ps(y1_v, cos_r1);
-                    __m512 s00 = _mm512_permutexvar_ps(y0_v, sin_r0);
-                    __m512 s10 = _mm512_permutexvar_ps(y0_v, sin_r1);
-                    __m512 s01 = _mm512_permutexvar_ps(y1_v, sin_r0);
-                    __m512 s11 = _mm512_permutexvar_ps(y1_v, sin_r1);
-
-                    __m512 n00 = _mm512_fmadd_ps(c00,  fx_v,  _mm512_mul_ps(s00, fy_v));
-                    __m512 n10 = _mm512_fmadd_ps(c10v, fx1_v, _mm512_mul_ps(s10, fy_v));
-                    __m512 n01 = _mm512_fmadd_ps(c01,  fx_v,  _mm512_mul_ps(s01, fy1_v));
-                    __m512 n11 = _mm512_fmadd_ps(c11,  fx1_v, _mm512_mul_ps(s11, fy1_v));
-
-                    __m512 nx0 = _mm512_fmadd_ps(u_v, _mm512_sub_ps(n10, n00), n00);
-                    __m512 nx1 = _mm512_fmadd_ps(u_v, _mm512_sub_ps(n11, n01), n01);
-                    __m512 n = _mm512_fmadd_ps(v_v, _mm512_sub_ps(nx1, nx0), nx0);
-                    n = _mm512_mul_ps(_mm512_add_ps(n, one), half);
-
-                    _mm512_storeu_ps(&noise[k][r][c_base], n);
-                }
-            }
-        }
+#if CRAFTAX_CLASSIC_X86_64 && (defined(__clang__) || defined(__GNUC__))
+    if (__builtin_cpu_supports("avx512f")) {
+        generate_perlin_noise_avx512(cos_a, sin_a, inv_scale, noise);
+    } else {
+        generate_perlin_noise_scalar(cos_a, sin_a, inv_scale, noise);
     }
+#else
+    generate_perlin_noise_scalar(cos_a, sin_a, inv_scale, noise);
+#endif
 
     // Tile-logic sweep -- reads precomputed noise, writes blocks
     for (int r = 0; r < MAP_SIZE; r++) {

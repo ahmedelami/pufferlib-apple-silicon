@@ -602,13 +602,6 @@ static inline void craftax_update_mobs_move_melee(
 ) {
     int32_t level = state->player_level;
     bool old_mask = state->melee_mobs.mask[level][index];
-    // Dead slot early-out: no observable effect on obs/reward/terminal.
-    // Skip body and RNG draws for speed. Breaks per-seed replay against
-    // JAX; define CRAFTAX_JAX_PARITY at build time to restore the
-    // branchless slow path (same pattern in every move_* below).
-#ifndef CRAFTAX_JAX_PARITY
-    if (!old_mask) return;
-#endif
     int32_t old_row = state->melee_mobs.position[level][index][0];
     int32_t old_col = state->melee_mobs.position[level][index][1];
     int32_t old_cooldown = state->melee_mobs.attack_cooldown[level][index];
@@ -735,9 +728,6 @@ static inline void craftax_update_mobs_move_passive(
 ) {
     int32_t level = state->player_level;
     bool old_mask = state->passive_mobs.mask[level][index];
-#ifndef CRAFTAX_JAX_PARITY
-    if (!old_mask) return;
-#endif
     int32_t old_row = state->passive_mobs.position[level][index][0];
     int32_t old_col = state->passive_mobs.position[level][index][1];
     int32_t mob_type = state->passive_mobs.type_id[level][index];
@@ -800,9 +790,6 @@ static inline void craftax_update_mobs_move_ranged(
 ) {
     int32_t level = state->player_level;
     bool old_mask = state->ranged_mobs.mask[level][index];
-#ifndef CRAFTAX_JAX_PARITY
-    if (!old_mask) return;
-#endif
     int32_t old_row = state->ranged_mobs.position[level][index][0];
     int32_t old_col = state->ranged_mobs.position[level][index][1];
     int32_t old_cooldown = state->ranged_mobs.attack_cooldown[level][index];
@@ -938,9 +925,6 @@ static inline void craftax_update_mobs_move_mob_projectile(
 ) {
     int32_t level = state->player_level;
     bool old_mask = state->mob_projectiles.mask[level][index];
-#ifndef CRAFTAX_JAX_PARITY
-    if (!old_mask) return;
-#endif
     int32_t old_row = state->mob_projectiles.position[level][index][0];
     int32_t old_col = state->mob_projectiles.position[level][index][1];
     int32_t proposed_row =
@@ -1015,9 +999,6 @@ static inline void craftax_update_mobs_move_player_projectile(
 ) {
     int32_t level = state->player_level;
     bool old_mask = state->player_projectiles.mask[level][index];
-#ifndef CRAFTAX_JAX_PARITY
-    if (!old_mask) return;
-#endif
     int32_t old_row = state->player_projectiles.position[level][index][0];
     int32_t old_col = state->player_projectiles.position[level][index][1];
     int32_t proposed_row =
