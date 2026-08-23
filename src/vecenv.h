@@ -8,6 +8,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <assert.h>
+#include <limits.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -30,9 +31,27 @@ typedef struct {
 
 static inline Dict* create_dict(int capacity) {
     Dict* dict = (Dict*)calloc(1, sizeof(Dict));
+    if (dict == NULL) {
+        fprintf(stderr, "create_dict: allocation failed\n");
+        abort();
+    }
+    if (capacity < 0) capacity = 0;
     dict->capacity = capacity;
-    dict->items = (DictItem*)calloc(capacity, sizeof(DictItem));
+    if (capacity > 0) {
+        dict->items = (DictItem*)calloc((size_t)capacity, sizeof(DictItem));
+        if (dict->items == NULL) {
+            free(dict);
+            fprintf(stderr, "create_dict: item allocation failed\n");
+            abort();
+        }
+    }
     return dict;
+}
+
+static inline void free_dict(Dict* dict) {
+    if (dict == NULL) return;
+    free(dict->items);
+    free(dict);
 }
 
 static inline DictItem* dict_get_unsafe(Dict* dict, const char* key) {
@@ -52,11 +71,30 @@ static inline DictItem* dict_get(Dict* dict, const char* key) {
 }
 
 static inline void dict_set(Dict* dict, const char* key, double value) {
-    assert(dict->size < dict->capacity);
     DictItem* item = dict_get_unsafe(dict, key);
     if (item != NULL) {
         item->value = value;
         return;
+    }
+    if (dict->size >= dict->capacity) {
+        int new_capacity = dict->capacity > 0 ? dict->capacity : 8;
+        while (new_capacity <= dict->size) {
+            if (new_capacity > INT_MAX / 2) {
+                fprintf(stderr, "dict_set: capacity overflow\n");
+                abort();
+            }
+            new_capacity *= 2;
+        }
+        DictItem* items = (DictItem*)realloc(
+            dict->items, (size_t)new_capacity * sizeof(DictItem));
+        if (items == NULL) {
+            fprintf(stderr, "dict_set: item allocation failed\n");
+            abort();
+        }
+        memset(items + dict->capacity, 0,
+            (size_t)(new_capacity - dict->capacity) * sizeof(DictItem));
+        dict->items = items;
+        dict->capacity = new_capacity;
     }
     dict->items[dict->size].key = key;
     dict->items[dict->size].value = value;
@@ -92,6 +130,7 @@ typedef struct StaticVec {
     StaticThreading* threading;
     int obs_size;
     int num_atns;
+    int num_threads;
     int action_mask_size;        // 0 unless env defines MY_ACTION_MASK
     int gpu;
     // Optional permutation: agent_perm[slot] = physical agent index in global buffers.
@@ -135,6 +174,17 @@ size_t get_obs_elem_size(void);
 void static_vec_step(StaticVec* vec);
 void gpu_vec_step(StaticVec* vec);
 void cpu_vec_step(StaticVec* vec);
+
+// Optional vector-level stepping hooks. Environments with arena-backed state
+// or cache-aware tiling can replace both the synchronous whole-vector step and
+// the per-buffer range used by the native rollout thread manager.
+#ifdef MY_VEC_STEP
+void MY_VEC_STEP(StaticVec* vec);
+#endif
+#ifdef MY_VEC_STEP_RANGE
+void MY_VEC_STEP_RANGE(
+    StaticVec* vec, int env_start, int env_count, int num_workers);
+#endif
 
 // Optional permutation. Sets agent_perm and re-populates env per-slot pointers
 // via my_setup_perm. Only defined when env opted in via MY_USES_PERM; otherwise
@@ -258,7 +308,9 @@ static void* static_omp_threadmanager(void* arg) {
     int num_workers = threading->num_threads / vec->buffers;
     if (num_workers < 1) num_workers = 1;
 
+#ifndef MY_VEC_STEP_RANGE
     Env* envs = (Env*)vec->envs;
+#endif
 
     printf("Num workers: %d\n", num_workers);
     while (true) {
@@ -288,10 +340,14 @@ static void* static_omp_threadmanager(void* arg) {
             memset(&vec->rewards[agent_start], 0, agents_per_buffer * sizeof(float));
             memset(&vec->terminals[agent_start], 0, agents_per_buffer * sizeof(float));
             clock_gettime(CLOCK_MONOTONIC, &t0);
+#ifdef MY_VEC_STEP_RANGE
+            MY_VEC_STEP_RANGE(vec, env_start, env_count, num_workers);
+#else
             #pragma omp parallel for schedule(static) num_threads(num_workers)
             for (int i = env_start; i < env_start + env_count; i++) {
                 c_step(&envs[i]);
             }
+#endif
             clock_gettime(CLOCK_MONOTONIC, &t1);
             my_accum[EVAL_ENV_STEP] += (t1.tv_sec - t0.tv_sec) * 1000.0f + (t1.tv_nsec - t0.tv_nsec) / 1e6f;
 
@@ -341,8 +397,27 @@ void static_vec_seq_step(StaticVec* vec) {
     }
 }
 
+#ifdef MY_VEC_CLOSE
+void my_vec_close(Env* envs);
+#else
+void my_vec_close(Env* envs) {
+    (void)envs;
+}
+#endif
+
+static void static_vec_cleanup_envs(Env* envs, int num_envs) {
+    if (envs == NULL) return;
+    for (int i = 0; i < num_envs; i++) {
+        c_close(&envs[i]);
+    }
+    // Custom vector cleanup hooks generally dereference envs[0]. Only invoke
+    // them after at least one environment was initialized.
+    if (num_envs > 0) my_vec_close(envs);
+    free(envs);
+}
+
 // Optional: Initialize all envs at once (for shared state, variable agents per env, etc.)
-// Default implementation creates envs until total_agents is reached
+// Default implementation creates envs until total_agents is reached.
 #ifdef MY_VEC_INIT
 Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_counts,
                  Dict* vec_kwargs, Dict* env_kwargs);
@@ -353,68 +428,172 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
     int total_agents = (int)dict_get(vec_kwargs, "total_agents")->value;
     int num_buffers = (int)dict_get(vec_kwargs, "num_buffers")->value;
     int agents_per_buffer = total_agents / num_buffers;
+    *num_envs_out = 0;
 
-    // Allocate max possible envs (1 agent per env worst case)
-    Env* envs = (Env*)calloc(total_agents, sizeof(Env));
+    // Allocate max possible envs (1 agent per env worst case).
+    Env* envs = (Env*)calloc((size_t)total_agents, sizeof(Env));
+    if (envs == NULL) {
+        fprintf(stderr, "vecenv: failed to allocate environment array\n");
+        return NULL;
+    }
 
     int num_envs = 0;
     int agents_created = 0;
     while (agents_created < total_agents) {
         srand(num_envs);
-        envs[num_envs].rng = num_envs;
+        envs[num_envs].rng = (unsigned int)num_envs;
         my_init(&envs[num_envs], env_kwargs);
-        agents_created += envs[num_envs].num_agents;
         num_envs++;
+
+        int env_agents = envs[num_envs - 1].num_agents;
+        int buffer_offset = agents_created % agents_per_buffer;
+        int buffer_remaining = agents_per_buffer - buffer_offset;
+        if (env_agents < 1 || env_agents > total_agents - agents_created
+                || env_agents > buffer_remaining) {
+            fprintf(stderr,
+                "vecenv: environment %d has %d agents and does not fit wholly "
+                "inside the configured agent buffers\n",
+                num_envs - 1, env_agents);
+            static_vec_cleanup_envs(envs, num_envs);
+            return NULL;
+        }
+        agents_created += env_agents;
     }
 
-    // Shrink to actual size needed
-    envs = (Env*)realloc(envs, num_envs * sizeof(Env));
-
-    // Fill buffer info by iterating through envs
-    int buf = 0;
-    int buf_agents = 0;
-    buffer_env_starts[0] = 0;
-    buffer_env_counts[0] = 0;
-    for (int i = 0; i < num_envs; i++) {
-        buf_agents += envs[i].num_agents;
-        buffer_env_counts[buf]++;
-        if (buf_agents >= agents_per_buffer && buf < num_buffers - 1) {
-            buf++;
-            buffer_env_starts[buf] = i + 1;
-            buffer_env_counts[buf] = 0;
-            buf_agents = 0;
+    // Fill an exact, contiguous environment layout for every buffer.
+    int env_cursor = 0;
+    for (int buf = 0; buf < num_buffers; buf++) {
+        buffer_env_starts[buf] = env_cursor;
+        int buffer_agents = 0;
+        while (env_cursor < num_envs && buffer_agents < agents_per_buffer) {
+            buffer_agents += envs[env_cursor].num_agents;
+            buffer_env_counts[buf]++;
+            env_cursor++;
+        }
+        if (buffer_agents != agents_per_buffer) {
+            fprintf(stderr, "vecenv: failed to construct whole-environment buffers\n");
+            static_vec_cleanup_envs(envs, num_envs);
+            return NULL;
         }
     }
 
+    Env* shrunk = (Env*)realloc(envs, (size_t)num_envs * sizeof(Env));
+    if (shrunk == NULL) {
+        fprintf(stderr, "vecenv: failed to resize environment array\n");
+        static_vec_cleanup_envs(envs, num_envs);
+        return NULL;
+    }
+
     *num_envs_out = num_envs;
-    return envs;
+    return shrunk;
 }
 #endif
 
-#ifdef MY_VEC_CLOSE
-void my_vec_close(Env* envs);
-#else
-void my_vec_close(Env* envs) {
-    return;
+static int static_vec_layout_is_valid(
+        Env* envs, int num_envs, int total_agents, int num_buffers,
+        const int* buffer_env_starts, const int* buffer_env_counts) {
+    if (envs == NULL || num_envs < 1) {
+        fprintf(stderr, "vecenv: vector initializer returned no environments\n");
+        return 0;
+    }
+
+    int agents_per_buffer = total_agents / num_buffers;
+    int expected_start = 0;
+    for (int buf = 0; buf < num_buffers; buf++) {
+        int start = buffer_env_starts[buf];
+        int count = buffer_env_counts[buf];
+        if (start != expected_start || count < 0 || count > num_envs - start) {
+            fprintf(stderr, "vecenv: vector initializer returned an invalid buffer layout\n");
+            return 0;
+        }
+
+        long long buffer_agents = 0;
+        for (int i = start; i < start + count; i++) {
+            int env_agents = envs[i].num_agents;
+            if (env_agents < 1) {
+                fprintf(stderr, "vecenv: environment %d has invalid num_agents=%d\n",
+                    i, env_agents);
+                return 0;
+            }
+            buffer_agents += env_agents;
+        }
+        if (buffer_agents != agents_per_buffer) {
+            fprintf(stderr,
+                "vecenv: buffer %d contains %lld agents; expected exactly %d\n",
+                buf, buffer_agents, agents_per_buffer);
+            return 0;
+        }
+        expected_start += count;
+    }
+
+    if (expected_start != num_envs) {
+        fprintf(stderr, "vecenv: vector initializer left environments unassigned\n");
+        return 0;
+    }
+    return 1;
 }
+
+#ifdef MY_VEC_VALIDATE
+int MY_VEC_VALIDATE(Dict* vec_kwargs, Dict* env_kwargs);
 #endif
 
 StaticVec* create_static_vec(int total_agents, int num_buffers, int gpu, Dict* vec_kwargs, Dict* env_kwargs) {
+    if (total_agents < 1 || num_buffers < 1 || total_agents % num_buffers != 0) {
+        fprintf(stderr,
+            "vecenv: total_agents must be positive and divide evenly across positive buffers\n");
+        return NULL;
+    }
+#ifdef MY_VEC_VALIDATE
+    if (!MY_VEC_VALIDATE(vec_kwargs, env_kwargs)) {
+        return NULL;
+    }
+#endif
     StaticVec* vec = (StaticVec*)calloc(1, sizeof(StaticVec));
+    if (vec == NULL) {
+        fprintf(stderr, "vecenv: failed to allocate vector state\n");
+        return NULL;
+    }
     vec->total_agents = total_agents;
     vec->buffers = num_buffers;
     vec->agents_per_buffer = total_agents / num_buffers;
     vec->obs_size = OBS_SIZE;
     vec->num_atns = NUM_ATNS;
+    DictItem* num_threads = dict_get_unsafe(vec_kwargs, "num_threads");
+    vec->num_threads = num_threads == NULL
+        ? omp_get_max_threads()
+        : (int)num_threads->value;
+    if (vec->num_threads < 1) vec->num_threads = omp_get_max_threads();
     vec->gpu = gpu;
 
     vec->buffer_env_starts = (int*)calloc(num_buffers, sizeof(int));
     vec->buffer_env_counts = (int*)calloc(num_buffers, sizeof(int));
+    if (vec->buffer_env_starts == NULL || vec->buffer_env_counts == NULL) {
+        free(vec->buffer_env_starts);
+        free(vec->buffer_env_counts);
+        free(vec);
+        fprintf(stderr, "vecenv: failed to allocate buffer layout\n");
+        return NULL;
+    }
 
     // Let my_vec_init allocate and initialize envs, fill buffer info
     int num_envs = 0;
     vec->envs = my_vec_init(&num_envs, vec->buffer_env_starts, vec->buffer_env_counts,
                             vec_kwargs, env_kwargs);
+    if (vec->envs == NULL) {
+        free(vec->buffer_env_starts);
+        free(vec->buffer_env_counts);
+        free(vec);
+        return NULL;
+    }
+    if (!static_vec_layout_is_valid(
+            (Env*)vec->envs, num_envs, total_agents, num_buffers,
+            vec->buffer_env_starts, vec->buffer_env_counts)) {
+        static_vec_cleanup_envs((Env*)vec->envs, num_envs);
+        free(vec->buffer_env_starts);
+        free(vec->buffer_env_counts);
+        free(vec);
+        return NULL;
+    }
     vec->size = num_envs;
 
     size_t obs_elem_size = obs_element_size();
@@ -608,22 +787,13 @@ void create_static_threads(StaticVec* vec, int num_threads, int horizon,
 }
 
 void static_vec_close(StaticVec* vec) {
-    Env* envs = (Env*)vec->envs;
-
     if (vec->threading != NULL) {
         atomic_store(&vec->threading->shutdown, 1);
         for (int i = 0; i < vec->buffers; i++) {
             pthread_join(vec->threading->threads[i], NULL);
         }
     }
-
-    for (int i = 0; i < vec->size; i++) {
-        Env* env = &envs[i];
-        c_close(env);
-    }
-
-    my_vec_close(envs);
-    free(vec->envs);
+    static_vec_cleanup_envs((Env*)vec->envs, vec->size);
     if (vec->threading != NULL) {
         free(vec->threading->buffer_states);
         free(vec->threading->threads);
@@ -739,13 +909,17 @@ const char* get_obs_dtype(void) { return dtype_symbol; }
 size_t get_obs_elem_size(void) { return obs_element_size(); }
 
 static inline void _static_vec_env_step(StaticVec* vec) {
+#ifdef MY_VEC_STEP
+    MY_VEC_STEP(vec);
+#else
     memset(vec->rewards, 0, vec->total_agents * sizeof(float));
     memset(vec->terminals, 0, vec->total_agents * sizeof(float));
     Env* envs = (Env*)vec->envs;
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(static) num_threads(vec->num_threads)
     for (int i = 0; i < vec->size; i++) {
         c_step(&envs[i]);
     }
+#endif
 }
 
 void gpu_vec_step(StaticVec* vec) {

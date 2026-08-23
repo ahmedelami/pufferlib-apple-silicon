@@ -36,6 +36,7 @@ pybind11::dict puf_log(pybind11::object pufferl_obj) {
     for (int i = 0; i < env_out->size; i++) {
         env_dict[env_out->items[i].key] = env_out->items[i].value;
     }
+    free_dict(env_out);
     result["env"] = env_dict;
 
     // Losses
@@ -114,6 +115,7 @@ pybind11::dict puf_eval_log(pybind11::object pufferl_obj) {
     for (int i = 0; i < env_out->size; i++) {
         env_dict[env_out->items[i].key] = env_out->items[i].value;
     }
+    free_dict(env_out);
     result["env"] = env_dict;
 
     return result;
@@ -323,14 +325,21 @@ std::unique_ptr<VecEnv> create_vec(py::dict args, int gpu) {
     int total_agents = (int)get_config(vec_kwargs, "total_agents");
     int num_buffers  = (int)get_config(vec_kwargs, "num_buffers");
 
-    Dict* vec_dict = py_dict_to_c_dict(vec_kwargs);
-    Dict* env_dict = py_dict_to_c_dict(env_kwargs);
+    using DictOwner = std::unique_ptr<Dict, decltype(&free_dict)>;
+    DictOwner vec_dict(py_dict_to_c_dict(vec_kwargs), &free_dict);
+    DictOwner env_dict(py_dict_to_c_dict(env_kwargs), &free_dict);
 
     auto ve = std::make_unique<VecEnv>();
     ve->gpu = gpu;
     {
         py::gil_scoped_release no_gil;
-        ve->vec = create_static_vec(total_agents, num_buffers, gpu, vec_dict, env_dict);
+        ve->vec = create_static_vec(
+            total_agents, num_buffers, gpu, vec_dict.get(), env_dict.get());
+    }
+    if (ve->vec == nullptr) {
+        throw std::runtime_error(
+            "native vector initialization failed "
+            "(incompatible process-global environment configuration)");
     }
     ve->total_agents  = total_agents;
     ve->obs_size      = get_obs_size();
@@ -376,8 +385,7 @@ py::dict vec_log(VecEnv& ve) {
     for (int i = 0; i < out->size; i++) {
         result[out->items[i].key] = out->items[i].value;
     }
-    free(out->items);
-    free(out);
+    free_dict(out);
     return result;
 }
 
@@ -449,13 +457,17 @@ std::unique_ptr<PuffeRL> create_pufferl(py::dict args) {
     }
 
     std::string env_name = args["env_name"].cast<std::string>();
-    Dict* vec_dict = py_dict_to_c_dict(vec_kwargs.cast<py::dict>());
-    Dict* env_dict = py_dict_to_c_dict(env_kwargs.cast<py::dict>());
+    using DictOwner = std::unique_ptr<Dict, decltype(&free_dict)>;
+    DictOwner vec_dict(
+        py_dict_to_c_dict(vec_kwargs.cast<py::dict>()), &free_dict);
+    DictOwner env_dict(
+        py_dict_to_c_dict(env_kwargs.cast<py::dict>()), &free_dict);
 
     std::unique_ptr<PuffeRL> pufferl;
     {
         pybind11::gil_scoped_release no_gil;
-        pufferl = create_pufferl_impl(hypers, env_name, vec_dict, env_dict);
+        pufferl = create_pufferl_impl(
+            hypers, env_name, vec_dict.get(), env_dict.get());
     }
 
     if (!pufferl) {

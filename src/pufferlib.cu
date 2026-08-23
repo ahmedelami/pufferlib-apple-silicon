@@ -247,6 +247,11 @@ struct EnvBuf {
 StaticVec* create_environments(int num_buffers, int total_agents,
         const std::string& env_name, Dict* vec_kwargs, Dict* env_kwargs, EnvBuf& env) {
     StaticVec* vec = create_static_vec(total_agents, num_buffers, 1, vec_kwargs, env_kwargs);
+    if (vec == nullptr) {
+        throw std::runtime_error(
+            "native vector initialization failed "
+            "(incompatible process-global environment configuration)");
+    }
     env.obs = {
         .data = (decltype(env.obs.data))vec->gpu_observations,
         .shape = {total_agents, get_obs_size()},
@@ -391,8 +396,8 @@ typedef struct {
 } PuffeRL;
 
 Dict* log_environments_impl(PuffeRL& pufferl) {
-    // Capacity raised from 32 to 64 to accommodate chess's per-bank
-    // hist_score_bank_<b> / hist_n_bank_<b> entries (16 keys for 8 banks).
+    // Ownership transfers to the caller. Dict storage grows automatically if
+    // an environment emits more keys than the initial capacity.
     Dict* out = create_dict(64);
     static_vec_log(pufferl.vec, out);
     return out;
@@ -1326,7 +1331,7 @@ __device__ void puff_advantage_row_scalar(
         float r_nxt = to_float(rewards[t_next]);
         float v = to_float(values[t]);
         float v_nxt = to_float(values[t_next]);
-        float delta = rho_t*r_nxt + gamma*v_nxt*nextnonterminal - v;
+        float delta = rho_t*(r_nxt + gamma*v_nxt*nextnonterminal - v);
         lastpufferlam = delta + gamma*lambda*c_t*lastpufferlam*nextnonterminal;
         advantages[t] = from_float(lastpufferlam);
     }

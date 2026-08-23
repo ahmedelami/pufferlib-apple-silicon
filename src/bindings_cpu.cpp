@@ -58,7 +58,8 @@ static void py_puff_advantage_cpu(
             float r_nxt = rewards[off + t_next];
             float v = values[off + t];
             float v_nxt = values[off + t_next];
-            float delta = rho_t * r_nxt + gamma * v_nxt * nextnonterminal - v;
+            float delta = rho_t * (
+                r_nxt + gamma * v_nxt * nextnonterminal - v);
             lastpufferlam = delta + gamma * lambda * c_t * lastpufferlam * nextnonterminal;
             advantages[off + t] = lastpufferlam;
         }
@@ -105,13 +106,20 @@ static std::unique_ptr<VecEnv> create_vec(py::dict args, int gpu = 0) {
     py::dict env_kwargs = args["env"].cast<py::dict>();
     int total_agents = (int)get_config(vec_kwargs, "total_agents");
     int num_buffers = (int)get_config(vec_kwargs, "num_buffers");
-    Dict* vec_dict = py_dict_to_c_dict(vec_kwargs);
-    Dict* env_dict = py_dict_to_c_dict(env_kwargs);
+    using DictOwner = std::unique_ptr<Dict, decltype(&free_dict)>;
+    DictOwner vec_dict(py_dict_to_c_dict(vec_kwargs), &free_dict);
+    DictOwner env_dict(py_dict_to_c_dict(env_kwargs), &free_dict);
 
     auto ve = std::make_unique<VecEnv>();
     {
         py::gil_scoped_release no_gil;
-        ve->vec = create_static_vec(total_agents, num_buffers, 0, vec_dict, env_dict);
+        ve->vec = create_static_vec(
+            total_agents, num_buffers, 0, vec_dict.get(), env_dict.get());
+    }
+    if (ve->vec == nullptr) {
+        throw std::runtime_error(
+            "native vector initialization failed "
+            "(incompatible process-global environment configuration)");
     }
     ve->total_agents = total_agents;
     ve->obs_size = get_obs_size();
@@ -146,8 +154,7 @@ static py::dict vec_log(VecEnv& ve) {
     py::dict result;
     for (int i = 0; i < out->size; i++)
         result[out->items[i].key] = out->items[i].value;
-    free(out->items);
-    free(out);
+    free_dict(out);
     return result;
 }
 
