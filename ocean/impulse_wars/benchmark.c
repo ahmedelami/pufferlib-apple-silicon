@@ -25,7 +25,7 @@ void perfTest(const uint32_t numSteps) {
     e->rewards = fastCalloc(NUM_DRONES, sizeof(float));
     e->actions = fastCalloc(NUM_DRONES * CONTINUOUS_ACTION_SIZE, sizeof(float));
     e->masks = fastCalloc(NUM_DRONES, sizeof(uint8_t));
-    e->terminals = fastCalloc(NUM_DRONES, sizeof(uint8_t));
+    e->terminals = fastCalloc(NUM_DRONES, sizeof(float));
     e->truncations = fastCalloc(NUM_DRONES, sizeof(uint8_t));
 
     // rayClient *client = createRayClient();

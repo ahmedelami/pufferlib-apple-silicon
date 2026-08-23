@@ -527,10 +527,11 @@ void setEnvFrameRate(iwEnv *e) {
 }
 
 iwEnv *initEnv(iwEnv *e, uint8_t numDrones, uint8_t numAgents, int8_t mapIdx, uint64_t seed, bool enableTeams, bool sittingDuck, bool isTraining, bool continuousActions) {
-    DEBUG_LOGF("seed: %lu", seed);
+    DEBUG_LOGF("seed: %llu", (unsigned long long)seed);
 
     e->numDrones = numDrones;
     e->numAgents = numAgents;
+    e->num_agents = numAgents;
     e->teamsEnabled = enableTeams;
     e->numTeams = numDrones;
     if (e->teamsEnabled) {
@@ -621,13 +622,13 @@ void setRewards(iwEnv *e, float winReward, float selfKillPunishment, float enemy
 void clearEnv(iwEnv *e) {
     // rewards get cleared in stepEnv every step
     // memset(e->masks, 1, e->numAgents * sizeof(uint8_t));
-    memset(e->terminals, 0x0, e->numAgents * sizeof(uint8_t));
+    memset(e->terminals, 0x0, e->numAgents * sizeof(float));
     memset(e->truncations, 0x0, e->numAgents * sizeof(uint8_t));
 
     e->episodeLength = 0;
     memset(e->stats, 0x0, sizeof(e->stats));
 
-    for (uint8_t i = 0; i < e->numDrones; i++) {
+    for (size_t i = 0; i < cc_array_size(e->drones); i++) {
         droneEntity *drone = safe_array_get_at(e->drones, i);
         destroyDrone(e, drone);
     }
@@ -1229,9 +1230,14 @@ void stepEnv(iwEnv *e) {
                 if (e->numDrones != e->numAgents && e->stepsLeft == 0) {
                     DEBUG_LOG("truncating episode");
                     memset(e->truncations, 1, e->numAgents * sizeof(uint8_t));
+                    for (uint8_t i = 0; i < e->numAgents; i++) {
+                        e->terminals[i] = 1.0f;
+                    }
                 } else {
                     DEBUG_LOG("terminating episode");
-                    memset(e->terminals, 1, e->numAgents * sizeof(uint8_t));
+                    for (uint8_t i = 0; i < e->numAgents; i++) {
+                        e->terminals[i] = 1.0f;
+                    }
                 }
 
                 Log log = {0};
@@ -1269,7 +1275,7 @@ void stepEnv(iwEnv *e) {
 
 #ifndef NDEBUG
     bool gotReward = false;
-    for (uint8_t i = 0; i < e->numDrones; i++) {
+    for (uint8_t i = 0; i < e->numAgents; i++) {
         if (e->rewards[i] > REWARD_EPS || e->rewards[i] < -REWARD_EPS) {
             gotReward = true;
             break;
@@ -1277,10 +1283,10 @@ void stepEnv(iwEnv *e) {
     }
     if (gotReward) {
         DEBUG_RAW_LOG("!!! rewards: [");
-        for (uint8_t i = 0; i < e->numDrones; i++) {
+        for (uint8_t i = 0; i < e->numAgents; i++) {
             const float reward = e->rewards[i];
             DEBUG_RAW_LOGF("%f", reward);
-            if (i < e->numDrones - 1) {
+            if (i < e->numAgents - 1) {
                 DEBUG_RAW_LOG(", ");
             }
         }

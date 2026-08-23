@@ -1,15 +1,20 @@
 #include "matsci.h"
 
-#define Env Matsci 
-#include "../env_binding.h"
+#define OBS_SIZE 3
+#define NUM_ATNS 3
+#define ACT_SIZES {1, 1, 1}
+#define OBS_TENSOR_T FloatTensor
 
-static int my_init(Env* env, PyObject* args, PyObject* kwargs) {
-    env->num_agents = unpack(kwargs, "num_agents");
+#define Env Matsci
+#include "vecenv.h"
+
+void my_init(Env* env, Dict* kwargs) {
+    DictItem* item = dict_get_unsafe(kwargs, "num_agents");
+    if (item == NULL) item = dict_get_unsafe(kwargs, "num_atoms");
+    env->num_agents = item == NULL ? 2 : (int)item->value;
     init(env);
-    return 0;
 }
 
-static int my_log(PyObject* dict, Log* log) {
-    assign_to_dict(dict, "score", log->score);
-    return 0;
+void my_log(Log* log, Dict* out) {
+    dict_set(out, "score", log->score);
 }

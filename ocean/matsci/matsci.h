@@ -2,7 +2,17 @@
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
+#include <stdint.h>
+
+#ifndef PUFFERLIB_USE_LAMMPS
+#define PUFFERLIB_USE_LAMMPS 0
+#endif
+
+#if PUFFERLIB_USE_LAMMPS
 #include <lammps/library.h>
+#endif
+
+#include "dynamics.h"
 #include "raylib.h"
 
 #define WIDTH 1080
@@ -23,10 +33,6 @@ static inline float clampf(float v, float min, float max) {
     if (v > max)
         return max;
     return v;
-}
-
-static inline float rndf(float a, float b) {
-    return a + ((float)rand() / (float)RAND_MAX) * (b - a);
 }
 
 static inline Vec3 add3(Vec3 a, Vec3 b) { return (Vec3){a.x + b.x, a.y + b.y, a.z + b.z}; }
@@ -69,15 +75,33 @@ typedef struct {
     float* observations;         // Required field. Ensure type matches in .py and .c
     float* actions;              // Required field. Ensure type matches in .py and .c
     float* rewards;              // Required field
-    unsigned char* terminals;    // Required field
+    float* terminals;            // Required field
     int num_agents;
     Vec3 goal;
     int tick;
     Client* client;
     void* handle;
+    MatsciPosition* positions;
+    unsigned int rng;
 } Matsci;
 
+static inline uint32_t matsci_next_random(unsigned int* state) {
+    // Per-environment SplitMix32 avoids rand()/srand() data races when worker
+    // threads reset several Matsci instances concurrently.
+    uint32_t z = (*state += UINT32_C(0x9e3779b9));
+    z = (z ^ (z >> 16)) * UINT32_C(0x21f0aaad);
+    z = (z ^ (z >> 15)) * UINT32_C(0x735a2d97);
+    return z ^ (z >> 15);
+}
+
+static inline float rndf(Matsci* env, float a, float b) {
+    const float unit = (float)(matsci_next_random(&env->rng) >> 8)
+        * (1.0f / 16777216.0f);
+    return a + unit * (b - a);
+}
+
 void init(Matsci* env) {
+#if PUFFERLIB_USE_LAMMPS
   void *handle;
   const char *lmpargv[] = { "liblammps", "-log", "none", "-screen", "none"};
   int lmpargc = sizeof(lmpargv)/sizeof(const char *);
@@ -85,8 +109,8 @@ void init(Matsci* env) {
   /* create LAMMPS instance */
   handle = lammps_open_no_mpi(lmpargc, (char **)lmpargv, NULL);
   if (handle == NULL) {
-    printf("LAMMPS initialization failed\n");
-    lammps_mpi_finalize();
+    fprintf(stderr, "matsci: LAMMPS initialization failed\n");
+    exit(EXIT_FAILURE);
   }
 
   // Setup the basic simulation parameters via string commands
@@ -113,37 +137,71 @@ void init(Matsci* env) {
   // Initialize
   lammps_command(handle, "run 0");
   env->handle = handle;
+#else
+  env->positions = (MatsciPosition*)calloc(
+      (size_t)env->num_agents, sizeof(MatsciPosition));
+  if (env->positions == NULL) {
+      fprintf(stderr, "matsci: native position allocation failed\n");
+      exit(EXIT_FAILURE);
+  }
+#endif
 }
 
 void compute_observations(Matsci* env) {
+#if PUFFERLIB_USE_LAMMPS
     double** x = (double **) lammps_extract_atom(env->handle, "x");
     for (int i=0; i<env->num_agents; i++) {
         env->observations[3*i] = x[i][0] - env->goal.x;
         env->observations[3*i + 1] = x[i][1] - env->goal.y;
         env->observations[3*i + 2] = x[i][2] - env->goal.z;
     }
+#else
+    for (int i=0; i<env->num_agents; i++) {
+        env->observations[3*i] = env->positions[i].x - env->goal.x;
+        env->observations[3*i + 1] = env->positions[i].y - env->goal.y;
+        env->observations[3*i + 2] = env->positions[i].z - env->goal.z;
+    }
+#endif
 }
 
+#if PUFFERLIB_USE_LAMMPS
 void reset_atom(Matsci* env, double** x, int i) {
-    x[i][0] = rndf(-10.0f, 10.0f);
-    x[i][1] = rndf(-10.0f, 10.0f);
-    x[i][2] = rndf(-10.0f, 10.0f);
+    x[i][0] = rndf(env, -10.0f, 10.0f);
+    x[i][1] = rndf(env, -10.0f, 10.0f);
+    x[i][2] = rndf(env, -10.0f, 10.0f);
 }
+#else
+void reset_atom(Matsci* env, int i) {
+    env->positions[i] = (MatsciPosition){
+        rndf(env, -10.0f, 10.0f),
+        rndf(env, -10.0f, 10.0f),
+        rndf(env, -10.0f, 10.0f),
+    };
+}
+#endif
 
 void c_reset(Matsci* env) {
+#if PUFFERLIB_USE_LAMMPS
     void* handle = env->handle;
     double** x = (double **) lammps_extract_atom(handle, "x");
     for (int i=0; i<env->num_agents; i++) {
 	reset_atom(env, x, i);
     }
-    env->goal.x = rndf(-10.0f, 10.0f);
-    env->goal.y = rndf(-10.0f, 10.0f);
-    env->goal.z = rndf(-10.0f, 10.0f);
+#else
+    for (int i=0; i<env->num_agents; i++) {
+        reset_atom(env, i);
+    }
+#endif
+    env->goal.x = rndf(env, -10.0f, 10.0f);
+    env->goal.y = rndf(env, -10.0f, 10.0f);
+    env->goal.z = rndf(env, -10.0f, 10.0f);
     env->tick = 0;
 }
 
 void c_step(Matsci* env) {
+#if PUFFERLIB_USE_LAMMPS
     void* handle = env->handle;
+#endif
     env->tick++;
 
     if (env->tick >= 1024) {
@@ -156,32 +214,60 @@ void c_step(Matsci* env) {
 	return;
     }
 
+#if PUFFERLIB_USE_LAMMPS
     double **v = (double **) lammps_extract_atom(handle, "v");
+#endif
     for (int i=0; i<env->num_agents; i++) {
 	env->rewards[i] = 0;
 	env->terminals[i] = 0;
 
+	#if PUFFERLIB_USE_LAMMPS
         v[i][0] = env->actions[3*i];
         v[i][1] = env->actions[3*i + 1];
         v[i][2] = env->actions[3*i + 2];
+#else
+        env->positions[i] = matsci_integrate_ballistic(
+            env->positions[i],
+            env->actions[3*i],
+            env->actions[3*i + 1],
+            env->actions[3*i + 2]);
+#endif
     }
 
+#if PUFFERLIB_USE_LAMMPS
     lammps_command(handle, "run 1");
 
     double** x = (double **) lammps_extract_atom(handle, "x");
+#endif
     for (int i=0; i<env->num_agents; i++) {
+	#if PUFFERLIB_USE_LAMMPS
         Vec3 pos = (Vec3){x[i][0], x[i][1], x[i][2]};
+#else
+        Vec3 pos = (Vec3){
+            (float)env->positions[i].x,
+            (float)env->positions[i].y,
+            (float)env->positions[i].z,
+        };
+#endif
         float dist = norm3(sub3(pos, env->goal));
 
         if (dist > 20.0f) {
+#if PUFFERLIB_USE_LAMMPS
             reset_atom(env, x, i);
+#else
+            reset_atom(env, i);
+#endif
             env->rewards[i] = -1;
             env->terminals[i] = 1;
             env->log.n += 1;
 	}
 
         if (dist < 1.0f) {
-           reset_atom(env, x, i);
+#if PUFFERLIB_USE_LAMMPS
+	           reset_atom(env, x, i);
+#else
+           reset_atom(env, i);
+#endif
            env->rewards[i] = 1;
            env->terminals[i] = 1;
            env->log.score += 1;
@@ -243,11 +329,17 @@ void handle_camera_controls(Client *client) {
 }
 
 void c_close(Matsci* env) {
-    /*
-    if (IsWindowReady()) {
-        CloseWindow();
+#if PUFFERLIB_USE_LAMMPS
+    if (env->handle != NULL) {
+        lammps_close(env->handle);
     }
-    */
+#else
+    free(env->positions);
+#endif
+    if (env->client != NULL) {
+        CloseWindow();
+        free(env->client);
+    }
 }
 
 void c_render(Matsci* env) {
@@ -298,9 +390,15 @@ void c_render(Matsci* env) {
     BeginMode3D(client->camera);
     DrawCubeWires((Vector3){0.0f, 0.0f, 0.0f}, 20.0f, 20.0f, 20.0f, WHITE);
 
-    double** x = (double **) lammps_extract_atom(env->handle, "x");
     for (int i=0; i<env->num_agents; i++) {
+#if PUFFERLIB_USE_LAMMPS
+        double** x = (double **) lammps_extract_atom(env->handle, "x");
         DrawSphere((Vector3){x[i][0], x[i][1], x[i][2]}, 0.1f, PUFF_CYAN);
+#else
+        MatsciPosition pos = env->positions[i];
+        DrawSphere((Vector3){
+            (float)pos.x, (float)pos.y, (float)pos.z}, 0.1f, PUFF_CYAN);
+#endif
     }
 
     DrawSphere((Vector3){env->goal.x, env->goal.y, env->goal.z}, 0.1f, PUFF_RED);
@@ -311,5 +409,3 @@ void c_render(Matsci* env) {
 
     EndDrawing();
 }
-
-
