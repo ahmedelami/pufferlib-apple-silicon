@@ -47,7 +47,7 @@ def synthetic_cutoff_task(args):
     score, cost = synthetic_basic_task(args)
     return score*min(2, np.log10(cost)), cost
 
-def test_sweep(args):
+def run_sweep(args):
     method = args['sweep']['method']
     if method == 'Random':
         sweep = pufferlib.sweep.Random(args['sweep'])
@@ -179,4 +179,4 @@ if __name__ == '__main__':
         visualize(args)
         exit(0)
 
-    test_sweep(args)
+    run_sweep(args)

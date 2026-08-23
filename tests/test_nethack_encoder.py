@@ -11,10 +11,27 @@ Run: python tests/test_nethack_encoder.py
 """
 import ctypes
 import os
+import shutil
 import subprocess
 import sys
 
 import numpy as np
+import pytest
+import torch
+
+
+CUDA_AVAILABLE = (
+    sys.platform.startswith("linux")
+    and torch.cuda.is_available()
+    and shutil.which("nvcc") is not None
+)
+if not CUDA_AVAILABLE:
+    pytest.skip(
+        "Nethack encoder tests require Linux, an NVIDIA CUDA device, and nvcc",
+        allow_module_level=True,
+    )
+
+pytestmark = pytest.mark.cuda
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.join(os.path.dirname(HERE), "src")

@@ -1,6 +1,7 @@
 import argparse
 import ctypes
 import os
+import platform
 import subprocess
 import tempfile
 from collections import deque
@@ -28,7 +29,12 @@ except ModuleNotFoundError:
     )
 
 
-OBS_SIZE = 8268
+FULL_NUM_TILE_CHANNELS = 37 + 5 + 5 * 8 + 1
+FULL_MAP_OBS_SIZE = 9 * 11 * FULL_NUM_TILE_CHANNELS
+FULL_OBS_SIZE = FULL_MAP_OBS_SIZE + 51
+PACKED_NUM_TILE_CHANNELS = 3 + 5
+PACKED_MAP_OBS_SIZE = 9 * 11 * PACKED_NUM_TILE_CHANNELS
+OBS_SIZE = PACKED_MAP_OBS_SIZE + 51
 NUM_ACTIONS = 43
 
 OBS_ROWS = 9
@@ -37,8 +43,8 @@ NUM_BLOCK_TYPES = 37
 NUM_ITEM_TYPES = 5
 NUM_MOB_CLASSES = 5
 NUM_MOB_TYPES = 8
-NUM_TILE_CHANNELS = NUM_BLOCK_TYPES + NUM_ITEM_TYPES + NUM_MOB_CLASSES * NUM_MOB_TYPES + 1
-MAP_OBS_SIZE = OBS_ROWS * OBS_COLS * NUM_TILE_CHANNELS
+NUM_TILE_CHANNELS = PACKED_NUM_TILE_CHANNELS
+MAP_OBS_SIZE = PACKED_MAP_OBS_SIZE
 MAP_SIZE = 48
 NUM_LEVELS = 9
 MONSTERS_KILLED_TO_CLEAR_LEVEL = 8
@@ -164,6 +170,54 @@ INVENTORY_OBS_NAMES = [
     "boss_vulnerable",
 ]
 
+
+def pack_symbolic_observation(observation):
+    """Convert Craftax's one-hot 8,268-vector to the native 843-vector.
+
+    The native environment keeps exact compact categories for the 99 visible
+    cells: block, item+1, visibility, then an 8-bit type-presence mask for each
+    of five mob classes. Zero is reserved for darkness/no item or mob. The
+    final 51 scalar values are copied unchanged.
+    """
+    source = np.asarray(observation, dtype=np.float32)
+    original_shape = source.shape
+    source = source.reshape(-1, FULL_OBS_SIZE)
+    cells = source[:, :FULL_MAP_OBS_SIZE].reshape(
+        -1, OBS_ROWS * OBS_COLS, FULL_NUM_TILE_CHANNELS)
+    visible = cells[:, :, -1] > 0.5
+    packed = np.zeros(
+        (source.shape[0], OBS_ROWS * OBS_COLS, PACKED_NUM_TILE_CHANNELS),
+        dtype=np.float32,
+    )
+    packed[:, :, 0] = np.argmax(
+        cells[:, :, :NUM_BLOCK_TYPES], axis=-1) * visible
+    packed[:, :, 1] = (
+        np.argmax(
+            cells[:, :, NUM_BLOCK_TYPES:NUM_BLOCK_TYPES + NUM_ITEM_TYPES],
+            axis=-1,
+        ) + 1
+    ) * visible
+    packed[:, :, 2] = visible
+
+    mob_start = NUM_BLOCK_TYPES + NUM_ITEM_TYPES
+    for mob_class in range(NUM_MOB_CLASSES):
+        start = mob_start + mob_class * NUM_MOB_TYPES
+        present = cells[:, :, start:start + NUM_MOB_TYPES] > 0.5
+        type_bits = np.left_shift(
+            np.uint16(1), np.arange(NUM_MOB_TYPES, dtype=np.uint16)
+        )
+        packed[:, :, 3 + mob_class] = (
+            np.sum(present.astype(np.uint16) * type_bits, axis=-1) * visible
+        )
+
+    result = np.concatenate(
+        (packed.reshape(source.shape[0], -1), source[:, FULL_MAP_OBS_SIZE:]),
+        axis=1,
+    )
+    if len(original_shape) == 1:
+        return result[0]
+    return result
+
 MOB_CLASS_NAMES = [
     "melee_mobs",
     "passive_mobs",
@@ -222,7 +276,8 @@ class JaxCraftaxBatch:
             rngs.append(rng)
             self.reset_keys.append(np.asarray(reset_key, dtype=np.uint32))
             states.append(state)
-            obs.append(np.asarray(env_obs, dtype=np.float32).reshape(-1))
+            obs.append(pack_symbolic_observation(
+                np.asarray(env_obs, dtype=np.float32).reshape(-1)))
 
         self.rngs = jnp.stack(rngs)
         self.states = _stack_states(states)
@@ -264,7 +319,9 @@ class JaxCraftaxBatch:
             dones,
             reset_keys,
         ) = self._step_batch(self.rngs, self.states, actions)
-        self.obs = np.asarray(obs, dtype=np.float32).reshape(self.num_envs, -1).copy()
+        self.obs = pack_symbolic_observation(
+            np.asarray(obs, dtype=np.float32).reshape(self.num_envs, -1)
+        ).copy()
         dones_np = np.asarray(dones, dtype=np.bool_)
         reset_keys_np = np.asarray(reset_keys, dtype=np.uint32)
         if self.resetter is not None and np.any(dones_np):
@@ -356,6 +413,15 @@ class PolicySnapshot:
 class ResetVerifier:
     def __init__(self):
         root = Path(__file__).resolve().parents[1]
+        raylib_archive = (
+            "raylib-5.5_macos" if platform.system() == "Darwin"
+            else "raylib-5.5_linux_amd64"
+        )
+        raylib_include = root / raylib_archive / "include"
+        if not (raylib_include / "raylib.h").is_file():
+            raise RuntimeError(
+                f"missing Raylib headers at {raylib_include}; run build.sh first"
+            )
         source = r"""
         #include <stdbool.h>
         #include <stdint.h>
@@ -391,7 +457,7 @@ class ResetVerifier:
                 "-I",
                 str(root),
                 "-I",
-                str(root / "raylib-5.5_linux_amd64/include"),
+                str(raylib_include),
                 str(src),
                 "-lm",
                 "-o",
@@ -535,7 +601,14 @@ def first_state_diff(jax_state, c_state, atol):
                 continue
             idx = np.unravel_index(int(np.argmax(diff)), diff.shape)
             max_diff = float(diff[idx])
-            if max_diff > atol:
+            field_atol = atol
+            if name == "light_map":
+                # Native state deliberately stores light in one byte. C and
+                # XLA can land on opposite sides of an exact byte boundary by
+                # one float ULP, so one quantization level is representational
+                # equivalence; observations still receive the strict atol.
+                field_atol = max(field_atol, 1.0 / 255.0 + 1e-6)
+            if max_diff > field_atol:
                 return (
                     name,
                     _format_index(np.asarray(idx)),
@@ -568,20 +641,14 @@ def section_for_index(idx):
         channel = idx % NUM_TILE_CHANNELS
         row = tile // OBS_COLS
         col = tile % OBS_COLS
-        if channel < NUM_BLOCK_TYPES:
-            return f"map_one_hot[row={row},col={col},block={channel}]"
-        channel -= NUM_BLOCK_TYPES
-        if channel < NUM_ITEM_TYPES:
-            return f"item_one_hot[row={row},col={col},item={channel}]"
-        channel -= NUM_ITEM_TYPES
-        if channel < NUM_MOB_CLASSES * NUM_MOB_TYPES:
-            mob_class = channel // NUM_MOB_TYPES
-            mob_type = channel % NUM_MOB_TYPES
-            return (
-                f"{MOB_CLASS_NAMES[mob_class]}_type_{mob_type}"
-                f"[row={row},col={col}]"
-            )
-        return f"light[row={row},col={col}]"
+        if channel == 0:
+            return f"map_id[row={row},col={col}]"
+        if channel == 1:
+            return f"item_id_plus_one[row={row},col={col}]"
+        if channel == 2:
+            return f"visibility[row={row},col={col}]"
+        mob_class = channel - 3
+        return f"{MOB_CLASS_NAMES[mob_class]}_type_mask[row={row},col={col}]"
 
     inv_idx = idx - MAP_OBS_SIZE
     if 0 <= inv_idx < len(INVENTORY_OBS_NAMES):
@@ -590,9 +657,9 @@ def section_for_index(idx):
 
 
 def subsystem_for_section(section):
-    if section.startswith("map_one_hot"):
+    if section.startswith("map_id"):
         return "symbolic_observation.map"
-    if section.startswith("item_one_hot"):
+    if section.startswith("item_id_plus_one"):
         return "symbolic_observation.item_or_ladder"
     if section.startswith("melee_mobs") or section.startswith("passive_mobs"):
         return "mobs.update_or_observation"
@@ -600,7 +667,7 @@ def subsystem_for_section(section):
         return "projectiles_or_ranged_mobs"
     if section.startswith("player_projectiles"):
         return "player_projectiles"
-    if section.startswith("light[") or section == "light_level":
+    if section.startswith("visibility[") or section == "light_level":
         return "light"
     if section.startswith("inventory."):
         return "inventory"

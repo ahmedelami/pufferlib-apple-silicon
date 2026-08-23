@@ -1,8 +1,8 @@
 // Test harness for NMMO3 encoder — thin wrapper around ocean.cu's real implementation.
-// Build: nvcc -shared -o ocean_test.so tests/test_nmmo3_cuda.cu -I pufferlib/src -lcublas -lcudnn -lcurand -Xcompiler -fPIC -O2
+// Build: nvcc -shared -o ocean_test.so tests/test_nmmo3_cuda.cu -I src -lcublas -lcudnn -lcurand -Xcompiler -fPIC -O2
 
 #define PRECISION_FLOAT
-#include "../pufferlib/src/models.cu"
+#include "../src/models.cu"
 
 extern "C" {
 

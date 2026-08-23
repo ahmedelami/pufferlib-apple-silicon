@@ -1,11 +1,32 @@
 import argparse
 import ctypes
 import os
+import shutil
 import subprocess
+from types import SimpleNamespace
 
+import pytest
 import torch
 
-from point_linear_max_reference import FlatLinearEncoder, PointLinearMaxEncoder, input_dim
+try:
+    from tests.point_linear_max_reference import (
+        FlatLinearEncoder,
+        PointLinearMaxEncoder,
+        input_dim,
+    )
+except ModuleNotFoundError:
+    # Preserve direct execution via ``python tests/test_point_linear_max.py``.
+    from point_linear_max_reference import FlatLinearEncoder, PointLinearMaxEncoder, input_dim
+
+
+CUDA_AVAILABLE = torch.cuda.is_available() and shutil.which("nvcc") is not None
+pytestmark = [
+    pytest.mark.cuda,
+    pytest.mark.skipif(
+        not CUDA_AVAILABLE,
+        reason="point-linear-max kernel requires an NVIDIA CUDA device and nvcc",
+    ),
+]
 
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -93,7 +114,7 @@ def make_encoders(args, device):
     return obs_dim, point_encoder, flat_encoder
 
 
-def test_correctness(lib, args, batches):
+def check_correctness(lib, args, batches):
     print("Correctness")
     device = torch.device("cuda")
     torch.manual_seed(0)
@@ -155,6 +176,17 @@ def benchmark(lib, args):
     print(f"  relative to flat: {kernel_ms / flat_ms:.2f}x")
 
 
+def test_correctness():
+    args = SimpleNamespace(
+        self_dim=2,
+        point_dim=4,
+        num_points=16,
+        hidden_size=128,
+    )
+    build()
+    check_correctness(load_lib(), args, [1, 17, 257, 4096])
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--self-dim", type=int, default=2)
@@ -173,7 +205,7 @@ def main():
 
     build(force=args.force_build)
     lib = load_lib()
-    test_correctness(lib, args, args.correctness_batches)
+    check_correctness(lib, args, args.correctness_batches)
     benchmark(lib, args)
 
 

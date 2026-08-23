@@ -1,8 +1,20 @@
+import importlib.util
+
+import pytest
 import torch
 import numpy as np
 
+pytestmark = pytest.mark.optional
 
-import pyximport
+if importlib.util.find_spec("pufferlib.extensions") is None:
+    pytest.skip(
+        "legacy Cython puffernet extension was removed from PufferLib 4.0",
+        allow_module_level=True,
+    )
+
+pyximport = pytest.importorskip(
+    "pyximport", reason="legacy puffernet tests require the optional Cython package"
+)
 pyximport.install(
     setup_args={"include_dirs": [
         np.get_include(),

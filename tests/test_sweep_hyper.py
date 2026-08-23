@@ -4,7 +4,6 @@ import pickle
 import numpy as np
 import torch
 
-import pandas as pd
 try:
     import matplotlib.pyplot as plt
     from matplotlib.ticker import MaxNLocator
@@ -159,6 +158,12 @@ def visualize_results(results_file):
     """
     Loads GP evaluation results and creates visualizations.
     """
+    try:
+        import pandas as pd
+    except ImportError:
+        print("Install pandas to visualize results: pip install pandas")
+        return
+
     if not _MATPLOTLIB_AVAILABLE:
         print("Install matplotlib to visualize results: pip install matplotlib")
         return

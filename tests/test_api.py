@@ -1,4 +1,13 @@
+import importlib.util
 from pdb import set_trace as T
+
+import pytest
+
+if importlib.util.find_spec("pufferlib.emulation") is None:
+    pytest.skip(
+        "legacy emulation/vector API was removed from PufferLib 4.0",
+        allow_module_level=True,
+    )
 
 import pufferlib
 import pufferlib.emulation

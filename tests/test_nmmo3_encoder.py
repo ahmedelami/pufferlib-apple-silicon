@@ -7,8 +7,10 @@ then compares numerics for forward output and all weight gradients.
 import subprocess
 import ctypes
 import os
+import shutil
 import sys
 import numpy as np
+import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -16,11 +18,20 @@ import torch.nn.functional as F
 SRC = os.path.join(os.path.dirname(__file__), "test_nmmo3_cuda.cu")
 SO = os.path.join(os.path.dirname(__file__), "ocean_test.so")
 
+CUDA_AVAILABLE = torch.cuda.is_available() and shutil.which("nvcc") is not None
+pytestmark = [
+    pytest.mark.cuda,
+    pytest.mark.skipif(
+        not CUDA_AVAILABLE,
+        reason="NMMO3 encoder tests require an NVIDIA CUDA device and nvcc",
+    ),
+]
+
 
 def build():
     cmd = [
         "nvcc", "-shared", "-o", SO, SRC,
-        "-I", os.path.join(os.path.dirname(__file__), "..", "pufferlib", "src"),
+        "-I", os.path.join(os.path.dirname(__file__), "..", "src"),
         "-lcublas", "-lcudnn", "-lcurand",
         "--compiler-options", "-fPIC", "-Xcompiler", "-O2",
     ]
@@ -121,7 +132,7 @@ def check_match(name, got, ref, atol=1e-4, rtol=1e-4):
 # Tests
 # ============================================================================
 
-def test_forward(lib, B):
+def check_forward(lib, B):
     """Compare CUDA encoder forward against PyTorch reference."""
     print(f"\n--- Forward B={B} ---")
     device = torch.device("cuda")
@@ -143,7 +154,7 @@ def test_forward(lib, B):
     print("  PASSED")
 
 
-def test_backward(lib, B):
+def check_backward(lib, B):
     """Compare CUDA encoder backward (all weight grads) against PyTorch autograd.
 
     Uses CUDA forward relu masks on the PyTorch path so both sides agree on
@@ -237,6 +248,22 @@ def test_backward(lib, B):
     print("  PASSED")
 
 
+@pytest.fixture(scope="module")
+def cuda_lib():
+    build()
+    return load_lib()
+
+
+@pytest.mark.parametrize("batch_size", [1, 8, 64])
+def test_forward(cuda_lib, batch_size):
+    check_forward(cuda_lib, batch_size)
+
+
+@pytest.mark.parametrize("batch_size", [1, 8, 64])
+def test_backward(cuda_lib, batch_size):
+    check_backward(cuda_lib, batch_size)
+
+
 # ============================================================================
 # Benchmarks
 # ============================================================================
@@ -288,8 +315,8 @@ if __name__ == "__main__":
 
     if mode in ("test", "all"):
         for B in [1, 8, 64]:
-            test_forward(lib, B)
-            test_backward(lib, B)
+            check_forward(lib, B)
+            check_backward(lib, B)
         print("\nAll tests passed!")
 
     if mode in ("bench", "all"):

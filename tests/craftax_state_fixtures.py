@@ -72,14 +72,9 @@ class CraftaxMobs2(ctypes.Structure):
 
 class CraftaxState(ctypes.Structure):
     _fields_ = [
-        ("map", _c_array(ctypes.c_int32, LEVELS, MAP_SIZE, MAP_SIZE)),
-        ("item_map", _c_array(ctypes.c_int32, LEVELS, MAP_SIZE, MAP_SIZE)),
-        ("mob_map", _c_array(ctypes.c_bool, LEVELS, MAP_SIZE, MAP_SIZE)),
-        ("light_map", _c_array(ctypes.c_float, LEVELS, MAP_SIZE, MAP_SIZE)),
-        ("down_ladders", _c_array(ctypes.c_int32, LEVELS, 2)),
-        ("up_ladders", _c_array(ctypes.c_int32, LEVELS, 2)),
-        ("chests_opened", _c_array(ctypes.c_bool, LEVELS)),
-        ("monsters_killed", _c_array(ctypes.c_int32, LEVELS)),
+        # Keep this order byte-for-byte identical to CraftaxState in
+        # ocean/craftax/craftax.h. The native state is ordered hot-to-cold;
+        # this is deliberately different from EnvState's field order.
         ("player_position", _c_array(ctypes.c_int32, 2)),
         ("player_level", ctypes.c_int32),
         ("player_direction", ctypes.c_int32),
@@ -131,6 +126,17 @@ class CraftaxState(ctypes.Structure):
         ("state_rng", _c_array(ctypes.c_uint32, 2)),
         ("timestep", ctypes.c_int32),
         ("fractal_noise_angles", _c_array(ctypes.c_int32, 4)),
+        ("mob_bits", _c_array(ctypes.c_uint64, LEVELS, MAP_SIZE)),
+        ("spawn_all_bits", _c_array(ctypes.c_uint64, LEVELS, MAP_SIZE)),
+        ("spawn_grave_bits", _c_array(ctypes.c_uint64, LEVELS, MAP_SIZE)),
+        ("spawn_water_bits", _c_array(ctypes.c_uint64, LEVELS, MAP_SIZE)),
+        ("map", _c_array(ctypes.c_uint8, LEVELS, MAP_SIZE, MAP_SIZE)),
+        ("item_map", _c_array(ctypes.c_uint8, LEVELS, MAP_SIZE, MAP_SIZE)),
+        ("light_map", _c_array(ctypes.c_uint8, LEVELS, MAP_SIZE, MAP_SIZE)),
+        ("down_ladders", _c_array(ctypes.c_int32, LEVELS, 2)),
+        ("up_ladders", _c_array(ctypes.c_int32, LEVELS, 2)),
+        ("chests_opened", _c_array(ctypes.c_bool, LEVELS)),
+        ("monsters_killed", _c_array(ctypes.c_int32, LEVELS)),
     ]
 
 
@@ -142,11 +148,89 @@ def _copy_to_c(c_array, value, dtype, shape):
     array = _np_array(value, dtype)
     if array.shape != shape:
         raise ValueError(f"shape mismatch: got {array.shape}, expected {shape}")
+    if array.nbytes != ctypes.sizeof(c_array):
+        raise ValueError(
+            f"byte-size mismatch: got {array.nbytes}, "
+            f"expected {ctypes.sizeof(c_array)}"
+        )
     ctypes.memmove(ctypes.addressof(c_array), array.ctypes.data, array.nbytes)
 
 
 def _copy_from_c(c_array, dtype):
     return np.asarray(np.ctypeslib.as_array(c_array), dtype=dtype).copy()
+
+
+def _pack_bool_map(value):
+    """Pack a [level, row, col] bool map into native uint64 row bitmaps."""
+    array = _np_array(value, np.bool_)
+    expected_shape = (LEVELS, MAP_SIZE, MAP_SIZE)
+    if array.shape != expected_shape:
+        raise ValueError(f"shape mismatch: got {array.shape}, expected {expected_shape}")
+    column_bits = np.left_shift(
+        np.uint64(1), np.arange(MAP_SIZE, dtype=np.uint64)
+    )
+    return np.bitwise_or.reduce(
+        array.astype(np.uint64) * column_bits,
+        axis=-1,
+    ).astype(np.uint64, copy=False)
+
+
+def _unpack_bool_map(value):
+    """Expand native uint64 row bitmaps into a [level, row, col] bool map."""
+    bits = _np_array(value, np.uint64)
+    expected_shape = (LEVELS, MAP_SIZE)
+    if bits.shape != expected_shape:
+        raise ValueError(f"shape mismatch: got {bits.shape}, expected {expected_shape}")
+    columns = np.arange(MAP_SIZE, dtype=np.uint64)
+    return ((bits[..., None] >> columns) & np.uint64(1)).astype(np.bool_)
+
+
+def _spawn_bitmaps(map_value):
+    """Rebuild the three cached spawn masks maintained by the C engine."""
+    map_array = _np_array(map_value, np.uint8)
+    expected_shape = (LEVELS, MAP_SIZE, MAP_SIZE)
+    if map_array.shape != expected_shape:
+        raise ValueError(f"shape mismatch: got {map_array.shape}, expected {expected_shape}")
+    spawn_all = (
+        (map_array == 2)
+        | (map_array == 7)
+        | (map_array == 25)
+        | (map_array == 26)
+    )
+    spawn_grave = (
+        (map_array == 33) | (map_array == 34) | (map_array == 35)
+    )
+    spawn_water = map_array == 3
+    return tuple(
+        _pack_bool_map(value)
+        for value in (spawn_all, spawn_grave, spawn_water)
+    )
+
+
+def _quantize_light_map(value):
+    """Convert JAX's [0, 1] float light map to the native uint8 scale."""
+    light = _np_array(value, np.float32)
+    expected_shape = (LEVELS, MAP_SIZE, MAP_SIZE)
+    if light.shape != expected_shape:
+        raise ValueError(f"shape mismatch: got {light.shape}, expected {expected_shape}")
+    return (np.clip(light, 0.0, 1.0) * np.float32(255.0)).astype(np.uint8)
+
+
+def _dequantize_light_map(value):
+    light = _copy_from_c(value, np.uint8).astype(np.float32)
+    return light / np.float32(255.0)
+
+
+def _canonical_light_map(value):
+    """Return light values in the precision representable by native state."""
+    light = np.clip(_np_array(value, np.float32), 0.0, 1.0)
+    scaled = light * np.float32(255.0)
+    nearest = np.rint(scaled)
+    # A native byte decoded as n/255 can multiply back to n-epsilon in
+    # float32. Snap only values already within numerical noise of an integer
+    # so canonicalization is idempotent without changing genuine fractions.
+    scaled = np.where(np.abs(scaled - nearest) < 1e-4, nearest, scaled)
+    return np.floor(scaled).astype(np.float32) / np.float32(255.0)
 
 
 def _mobs_payload(mobs):
@@ -290,15 +374,39 @@ def deserialize_jax_state_to_c(buffer: bytes) -> CraftaxState:
     payload = pickle.loads(buffer)
     state = CraftaxState()
 
-    _copy_to_c(state.map, payload["map"], np.int32, (LEVELS, MAP_SIZE, MAP_SIZE))
+    map_value = _np_array(payload["map"], np.uint8)
+    _copy_to_c(state.map, map_value, np.uint8, (LEVELS, MAP_SIZE, MAP_SIZE))
     _copy_to_c(
-        state.item_map, payload["item_map"], np.int32, (LEVELS, MAP_SIZE, MAP_SIZE)
+        state.item_map, payload["item_map"], np.uint8, (LEVELS, MAP_SIZE, MAP_SIZE)
     )
     _copy_to_c(
-        state.mob_map, payload["mob_map"], np.bool_, (LEVELS, MAP_SIZE, MAP_SIZE)
+        state.light_map,
+        _quantize_light_map(payload["light_map"]),
+        np.uint8,
+        (LEVELS, MAP_SIZE, MAP_SIZE),
+    )
+    mob_bits = _pack_bool_map(payload["mob_map"])
+    spawn_all_bits, spawn_grave_bits, spawn_water_bits = _spawn_bitmaps(map_value)
+    _copy_to_c(
+        state.mob_bits, mob_bits, np.uint64, (LEVELS, MAP_SIZE)
     )
     _copy_to_c(
-        state.light_map, payload["light_map"], np.float32, (LEVELS, MAP_SIZE, MAP_SIZE)
+        state.spawn_all_bits,
+        spawn_all_bits,
+        np.uint64,
+        (LEVELS, MAP_SIZE),
+    )
+    _copy_to_c(
+        state.spawn_grave_bits,
+        spawn_grave_bits,
+        np.uint64,
+        (LEVELS, MAP_SIZE),
+    )
+    _copy_to_c(
+        state.spawn_water_bits,
+        spawn_water_bits,
+        np.uint64,
+        (LEVELS, MAP_SIZE),
     )
     _copy_to_c(state.down_ladders, payload["down_ladders"], np.int32, (LEVELS, 2))
     _copy_to_c(state.up_ladders, payload["up_ladders"], np.int32, (LEVELS, 2))
@@ -436,8 +544,10 @@ def craftax_state_to_jax(state: CraftaxState, template: EnvState | None = None) 
     return EnvState(
         map=jnp.asarray(_copy_from_c(state.map, np.int32)),
         item_map=jnp.asarray(_copy_from_c(state.item_map, np.int32)),
-        mob_map=jnp.asarray(_copy_from_c(state.mob_map, np.bool_)),
-        light_map=jnp.asarray(_copy_from_c(state.light_map, np.float32)),
+        mob_map=jnp.asarray(
+            _unpack_bool_map(_copy_from_c(state.mob_bits, np.uint64))
+        ),
+        light_map=jnp.asarray(_dequantize_light_map(state.light_map)),
         down_ladders=jnp.asarray(_copy_from_c(state.down_ladders, np.int32)),
         up_ladders=jnp.asarray(_copy_from_c(state.up_ladders, np.int32)),
         chests_opened=jnp.asarray(_copy_from_c(state.chests_opened, np.bool_)),
@@ -537,7 +647,10 @@ def flatten_env_state(state: EnvState):
         "map": np.asarray(state.map),
         "item_map": np.asarray(state.item_map),
         "mob_map": np.asarray(state.mob_map),
-        "light_map": np.asarray(state.light_map),
+        # The optimized native state stores light as uint8. Compare the
+        # representable value so float-to-byte quantization is not reported as
+        # a semantic state divergence.
+        "light_map": _canonical_light_map(state.light_map),
         "down_ladders": np.asarray(state.down_ladders),
         "up_ladders": np.asarray(state.up_ladders),
         "chests_opened": np.asarray(state.chests_opened),
@@ -609,10 +722,13 @@ def assert_env_states_equal(actual: EnvState, expected: EnvState, context: str):
         actual_value = actual_flat[name]
         err_msg = f"{context}: field {name}"
         if expected_value.dtype.kind == "f":
+            field_atol = 1e-6
+            if name == "light_map":
+                field_atol = 1.0 / 255.0 + 1e-6
             np.testing.assert_allclose(
                 actual_value,
                 expected_value,
-                atol=1e-6,
+                atol=field_atol,
                 rtol=0.0,
                 err_msg=err_msg,
             )

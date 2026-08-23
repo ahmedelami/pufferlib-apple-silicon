@@ -27,6 +27,14 @@ dependencies = [
     "pybind11",
 ]
 
+[project.optional-dependencies]
+test = [
+    "pytest>=8",
+    # Exact oracle versions used by the native Craftax parity suite.
+    "jax==0.11.1",
+    "craftax==1.5.0",
+]
+
 [project.scripts]
 puffer = "pufferlib.pufferl:main"
 
@@ -40,3 +48,10 @@ include = ["pufferlib*"]
 [build-system]
 requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "cuda: requires an NVIDIA CUDA device and CUDA toolkit",
+    "optional: requires optional research or environment dependencies",
+]
