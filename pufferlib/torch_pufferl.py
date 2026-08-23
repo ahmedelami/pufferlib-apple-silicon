@@ -14,6 +14,7 @@ import subprocess
 from copy import deepcopy
 from collections import defaultdict
 from contextlib import nullcontext
+from types import MethodType
 
 import numpy as np
 
@@ -148,6 +149,8 @@ _VALIDATED_COMPILE_MACOS_VERSION = '27.0'
 _VALIDATED_COMPILE_MACOS_BUILD = '26A5378j'
 _VALIDATED_POLICY_FORWARD = pufferlib.models.Policy.forward
 _VALIDATED_POLICY_FORWARD_EVAL = pufferlib.models.Policy.forward_eval
+_VALIDATED_MINGRU_FORWARD_TRAIN = pufferlib.models.MinGRU.forward_train
+_VALIDATED_PPO_COMPILE_BREAK_EVEN_TIMESTEPS = 54_800_000
 
 
 def _quiet_command(*command):
@@ -242,6 +245,19 @@ def _policy_geometry_mismatches(policy, device):
                 is not _VALIDATED_POLICY_FORWARD_EVAL):
         mismatches.append(
             'actual policy forward_eval implementation is not validated')
+    network_forward = getattr(network.forward_train, '__func__', None)
+    metal_module = getattr(pufferlib, 'mps_mingru', None)
+    metal_forward = getattr(metal_module, 'forward_train', None)
+    portable_network_forward = (
+        'forward_train' not in network.__dict__
+        and network_forward is _VALIDATED_MINGRU_FORWARD_TRAIN)
+    installed_metal_forward = (
+        'forward_train' in network.__dict__
+        and metal_forward is not None
+        and network_forward is metal_forward)
+    if not (portable_network_forward or installed_metal_forward):
+        mismatches.append(
+            'actual MinGRU forward_train implementation is not validated')
     if (encoder.in_features, encoder.out_features) != (118, 64):
         mismatches.append('actual encoder geometry is not 118x64')
     if (network.hidden_size, network.num_layers) != (64, 2):
@@ -314,7 +330,8 @@ def _policy_compile_mismatches(args, vec, policy, device, rollout_device,
             'rollout device is not MPS'),
         (torch.device(device) == torch.device(rollout_device),
             'training and rollout devices differ'),
-        (amp_dtype is None, 'AMP is enabled'),
+        (amp_dtype in (None, torch.bfloat16),
+            'AMP dtype is not float32 or bfloat16'),
         (bool(mps_host_alias_io), 'MPS host aliasing is inactive'),
         (os.environ.get('PYTORCH_ENABLE_MPS_FALLBACK') == '0',
             'PYTORCH_ENABLE_MPS_FALLBACK is not 0'),
@@ -330,6 +347,8 @@ def _policy_compile_mismatches(args, vec, policy, device, rollout_device,
             'Torch compiler bisector backend override is active'),
         (int(args.get('world_size', 1)) == 1,
             'distributed training is enabled'),
+        (bool(args.get('reset_state', True)),
+            'persistent cross-horizon recurrent state is unvalidated'),
         (not bool(getattr(vec, 'gpu', False)),
             'native vector backend is not CPU'),
         (type(policy) is models.Policy, 'policy class is not Policy'),
@@ -356,8 +375,178 @@ def _policy_compile_mismatches(args, vec, policy, device, rollout_device,
     return mismatches
 
 
+def _mingru_train_scan_mismatches(args, vec, policy, device, rollout_device,
+        amp_dtype, mps_host_alias_io):
+    """Return why the fixed-shape FP32 Metal training scan is inapplicable."""
+    mismatches = _policy_compile_mismatches(
+        args, vec, policy, device, rollout_device, amp_dtype,
+        mps_host_alias_io)
+    network = getattr(policy, 'network', None)
+    compile_policy = str(
+        args.get('torch', {}).get('compile_policy', 'off')).strip().lower()
+    horizon = int(args.get('train', {}).get('horizon', 0))
+    minibatch_size = int(
+        args.get('train', {}).get('minibatch_size', 0))
+    checks = (
+        (amp_dtype is None, 'Metal MinGRU is validated only for FP32'),
+        (compile_policy in ('auto', 'inductor'),
+            'validated policy compilation is not requested'),
+        (horizon == 64 and minibatch_size // max(horizon, 1) == 1024,
+            'training sequence geometry is not [1024,64]'),
+        (pufferlib.models.MinGRU.forward_train
+            is _VALIDATED_MINGRU_FORWARD_TRAIN,
+            'MinGRU.forward_train class method is modified'),
+        (network is not None
+            and 'forward_train' not in getattr(network, '__dict__', {})
+            and getattr(getattr(network, 'forward_train', None), '__func__', None)
+                is _VALIDATED_MINGRU_FORWARD_TRAIN,
+            'actual MinGRU forward_train implementation is not validated'),
+    )
+    for matched, reason in checks:
+        if not matched and reason not in mismatches:
+            mismatches.append(reason)
+    return mismatches
+
+
+def _prepare_mingru_train_scan(args, vec, policy, device, rollout_device,
+        amp_dtype, mps_host_alias_io):
+    """Guard and install the scan on one network instance before compilation.
+
+    Returns metadata plus the installed network (or ``None``). The caller must
+    restore the instance method if policy compilation does not promote.
+    """
+    requested = str(
+        args.get('torch', {}).get('mingru_train_scan', 'off')).strip().lower()
+    if requested not in ('off', 'auto', 'metal'):
+        raise ValueError(
+            'torch.mingru_train_scan must be off, auto, or metal')
+    if requested == 'off':
+        return (requested, 'off', 'disabled by configuration',
+            0.0, False, None)
+
+    attempt_started = time.perf_counter()
+    mismatches = _mingru_train_scan_mismatches(
+        args, vec, policy, device, rollout_device, amp_dtype,
+        mps_host_alias_io)
+    if mismatches:
+        reason = '; '.join(mismatches)
+        if requested == 'auto':
+            return (requested, 'off', reason,
+                time.perf_counter() - attempt_started, False, None)
+        raise ValueError(
+            'torch.mingru_train_scan=metal requires the validated FP32 '
+            f'Breakout/M5 policy configuration: {reason}')
+
+    try:
+        from pufferlib import mps_mingru
+        network = policy.network
+        network.forward_train = MethodType(mps_mingru.forward_train, network)
+    except Exception as exc:
+        startup_seconds = time.perf_counter() - attempt_started
+        if requested == 'auto':
+            return (requested, 'off',
+                f'setup failed: {type(exc).__name__}: {exc}',
+                startup_seconds, False, None)
+        raise RuntimeError(
+            'failed to install the validated Metal MinGRU scan') from exc
+
+    return (requested, 'pending',
+        'guarded instance override awaiting policy compiler preflight',
+        time.perf_counter() - attempt_started, False, network)
+
+
+def _restore_mingru_train_scan(network):
+    if network is not None and 'forward_train' in network.__dict__:
+        del network.__dict__['forward_train']
+
+
+def _finalize_mingru_train_scan(prepared, policy_compile_effective,
+        policy_compile_preflight, policy_compile_reason):
+    requested, effective, reason, startup_seconds, preflight, network = prepared
+    if network is None:
+        return requested, effective, reason, startup_seconds, preflight
+    if (policy_compile_effective == 'inductor'
+            and policy_compile_preflight):
+        return (requested, 'metal',
+            'validated FP32 M5 Pro training-only Metal forward/backward; '
+            'policy fullgraph preflight passed; forward_eval unchanged',
+            startup_seconds, True)
+
+    _restore_mingru_train_scan(network)
+    reason = 'validated policy compiler is inactive: ' + policy_compile_reason
+    if requested == 'auto':
+        return requested, 'off', reason, startup_seconds, False
+    raise RuntimeError(
+        'torch.mingru_train_scan=metal requires an effective validated policy '
+        f'compiler: {reason}')
+
+
+def configure_policy_and_mingru_train_scan(args, vec, policy, device,
+        rollout_device, amp_dtype, mps_host_alias_io, state):
+    """Atomically configure the training scan and enclosing policy graph.
+
+    The scan must be visible while Dynamo traces the policy. If an ``auto``
+    scan fails that trace or preflight, restore the untouched class method and
+    retry the portable policy compiler once. Explicit ``metal`` remains
+    fail-closed. No compiled wrapper is attached before a complete preflight.
+    """
+    prepared = _prepare_mingru_train_scan(
+        args, vec, policy, device, rollout_device, amp_dtype,
+        mps_host_alias_io)
+    installed_network = prepared[-1]
+    fallback_reason = None
+
+    def configure_core_policy():
+        return configure_policy_compile(
+            args, vec, policy, device, rollout_device, amp_dtype,
+            mps_host_alias_io, state)
+
+    first_policy_started = time.perf_counter()
+    try:
+        policy_result = configure_core_policy()
+    except Exception as exc:
+        if installed_network is None or prepared[0] != 'auto':
+            _restore_mingru_train_scan(installed_network)
+            raise
+        failed_startup = time.perf_counter() - first_policy_started
+        _restore_mingru_train_scan(installed_network)
+        fallback_reason = (
+            'Metal policy compile/preflight failed: '
+            f'{type(exc).__name__}: {exc}; portable policy retried')
+        policy_result = configure_core_policy()
+        policy_result = (
+            *policy_result[:3],
+            failed_startup + policy_result[3],
+            policy_result[4],
+        )
+    else:
+        if (installed_network is not None
+                and policy_result[1] != 'inductor'
+                and prepared[0] == 'auto'):
+            _restore_mingru_train_scan(installed_network)
+            fallback_reason = (
+                'Metal policy compile/preflight did not promote: '
+                f'{policy_result[2]}; portable policy retried')
+            failed_startup = policy_result[3]
+            policy_result = configure_core_policy()
+            policy_result = (
+                *policy_result[:3],
+                failed_startup + policy_result[3],
+                policy_result[4],
+            )
+
+    if fallback_reason is None:
+        scan_result = _finalize_mingru_train_scan(
+            prepared, policy_result[1], policy_result[4], policy_result[2])
+    else:
+        scan_result = (
+            prepared[0], 'off', fallback_reason, prepared[3], False)
+    return policy_result, scan_result
+
+
 def _preflight_policy_compile(compiled_eval, compiled_train, policy, state,
-        device, total_agents, horizon, minibatch_size, obs_size):
+        device, total_agents, horizon, minibatch_size, obs_size,
+        amp_dtype=None):
     """Materialize eval, train, and backward graphs before promotion."""
     device = torch.device(device)
     segments = int(minibatch_size) // int(horizon)
@@ -366,18 +555,75 @@ def _preflight_policy_compile(compiled_eval, compiled_train, policy, state,
     train_observations = torch.zeros(
         segments, int(horizon), int(obs_size),
         dtype=torch.float32, device=device)
+    preflight_state = state
+    input_state_tensors = _state_tensors(preflight_state)
+    expected_policy_dtype = amp_dtype or torch.float32
+    if any(
+            value.is_floating_point()
+            and value.dtype != expected_policy_dtype
+            for value in input_state_tensors):
+        raise RuntimeError(
+            'compiled policy preflight recurrent-state dtype does not match '
+            f'the requested {expected_policy_dtype} execution contract')
+
+    def autocast_context():
+        if amp_dtype is None:
+            return nullcontext()
+        return torch.autocast(device_type=device.type, dtype=amp_dtype)
+
+    original_training = policy.training
     policy.zero_grad(set_to_none=True)
     synchronize(device)
     try:
+        policy.eval()
         with torch.no_grad():
-            eval_logits, eval_values, eval_state = compiled_eval(
-                eval_observations, state)
-        train_logits, train_values = compiled_train(train_observations)
+            eval_state = preflight_state
+            # Materialize and exercise the persistent recurrent-state path,
+            # not only its first call. BF16 state is fed back for a complete
+            # rollout horizon so a step-two dtype/shape specialization cannot
+            # escape the guarded setup phase.
+            for _ in range(int(horizon)):
+                with autocast_context():
+                    eval_logits, eval_values, eval_state = compiled_eval(
+                        eval_observations, eval_state)
+        policy.train()
+        with autocast_context():
+            train_logits, train_values = compiled_train(train_observations)
         # Force AOTAutograd/Inductor to materialize the backward graph too.
         (train_logits.float().sum() + train_values.float().sum()).backward()
         synchronize(device)
+        output_state_tensors = _state_tensors(eval_state)
+        state_contract = (
+            len(input_state_tensors) == len(output_state_tensors)
+            and all(
+                not original.is_floating_point()
+                or original.dtype == expected_policy_dtype
+                for original in input_state_tensors
+            )
+            and all(
+                output.shape == original.shape
+                and output.device == original.device
+                and output.dtype == original.dtype
+                for original, output in zip(
+                    input_state_tensors, output_state_tensors)
+            )
+        )
+        parameter_contract = all(
+            parameter.dtype == torch.float32
+            and parameter.grad is not None
+            and parameter.grad.dtype == torch.float32
+            for parameter in policy.parameters()
+        )
+        output_contract = all(
+            value.dtype == expected_policy_dtype
+            for value in (
+                eval_logits, eval_values, train_logits, train_values)
+        )
         if not (
-                torch.isfinite(eval_logits).all()
+                state_contract
+                and parameter_contract
+                and output_contract
+                and torch.isfinite(eval_logits).all()
                 and torch.isfinite(eval_values).all()
                 and all(torch.isfinite(value).all()
                     for value in _state_tensors(eval_state))
@@ -386,9 +632,12 @@ def _preflight_policy_compile(compiled_eval, compiled_train, policy, state,
                 and all(parameter.grad is not None
                     and torch.isfinite(parameter.grad).all()
                     for parameter in policy.parameters())):
-            raise RuntimeError('compiled policy preflight produced non-finite values')
+            raise RuntimeError(
+                'compiled policy preflight violated its recurrent-state or '
+                'FP32-gradient contract, or produced non-finite values')
     finally:
         policy.zero_grad(set_to_none=True)
+        policy.train(original_training)
 
 
 def _state_tensors(value):
@@ -480,6 +729,7 @@ def configure_policy_compile(args, vec, policy, device, rollout_device,
             args['train']['horizon'],
             args['train']['minibatch_size'],
             vec.obs_size,
+            amp_dtype,
         )
     except Exception as exc:
         startup_seconds = time.perf_counter() - attempt_started
@@ -494,10 +744,276 @@ def configure_policy_compile(args, vec, policy, device, rollout_device,
     policy.forward_eval = compiled_eval
     policy.forward = compiled_train
     startup_seconds = time.perf_counter() - attempt_started
+    precision_contract = (
+        'Breakout execution-contract verified experimental BF16 autocast'
+        if amp_dtype is torch.bfloat16
+        else 'validated Breakout FP32')
     return requested, 'inductor', (
-        'validated Breakout FP32 direct-MPS graph; '
+        f'{precision_contract} direct-MPS graph; '
         'Dynamo wrappers verified; fullgraph eval/train/backward preflight; '
         'layout_optimization=False'), startup_seconds, True
+
+
+def _ppo_train_outputs(policy_forward, observations, actions, old_logprobs,
+        old_values, returns, advantages, priority, clip_coef, vf_clip_coef,
+        vf_coef, ent_coef):
+    """Run the supplied-action PPO math in its production operation order.
+
+    The coefficients are callable inputs rather than benchmark constants. A
+    trainer therefore materializes the graph with its own sweep/config values,
+    while the fixed input shapes retain the validated fullgraph specialization.
+    """
+    logits, newvalue = policy_forward(observations)
+    logits = logits.float()
+    newvalue = newvalue.float()
+    _, newlogprob, entropy = sample_logits(logits, action=actions)
+    newlogprob = newlogprob.reshape(old_logprobs.shape)
+    logratio = newlogprob - old_logprobs
+    ratio = logratio.exp()
+
+    normalized_advantages = priority * (
+        advantages - advantages.mean()) / (advantages.std() + 1e-8)
+    pg_loss1 = -normalized_advantages * ratio
+    pg_loss2 = -normalized_advantages * torch.clamp(
+        ratio, 1 - clip_coef, 1 + clip_coef)
+    pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+
+    newvalue = newvalue.view(returns.shape)
+    v_clipped = old_values + torch.clamp(
+        newvalue - old_values, -vf_clip_coef, vf_clip_coef)
+    v_loss_unclipped = (newvalue - returns) ** 2
+    v_loss_clipped = (v_clipped - returns) ** 2
+    v_loss = 0.5*torch.max(v_loss_unclipped, v_loss_clipped).mean()
+
+    entropy_loss = entropy.mean()
+    loss = pg_loss + vf_coef*v_loss - ent_coef*entropy_loss
+    # Raw policy/statistic outputs remain explicit graph outputs. Besides
+    # preserving the validated boundary, this lets setup verify the fused graph
+    # against the already-promoted compiled-policy-only implementation.
+    return (
+        logits, newvalue, newlogprob, entropy, logratio, ratio,
+        pg_loss, v_loss, entropy_loss, loss)
+
+
+def _preflight_ppo_compile(compiled_ppo, policy_forward, policy, device,
+        horizon, minibatch_size, obs_size, coefficients, max_grad_norm):
+    """Materialize and compare fused PPO forward/backward without mutation."""
+    device = torch.device(device)
+    segments = int(minibatch_size) // int(horizon)
+    observations = torch.zeros(
+        segments, int(horizon), int(obs_size),
+        dtype=torch.float32, device=device)
+    actions = torch.arange(
+        int(minibatch_size), dtype=torch.int64, device=device
+    ).remainder(3).reshape(segments, int(horizon), 1).float()
+    old_logprobs = torch.zeros(
+        segments, int(horizon), dtype=torch.float32, device=device)
+    old_values = torch.zeros_like(old_logprobs)
+    returns = torch.full_like(old_logprobs, 0.25)
+    advantages = torch.linspace(
+        -1.0, 1.0, int(minibatch_size),
+        dtype=torch.float32, device=device).reshape(segments, int(horizon))
+    priority = torch.linspace(
+        0.75, 1.25, segments,
+        dtype=torch.float32, device=device).unsqueeze(1)
+    inputs = (
+        observations, actions, old_logprobs, old_values,
+        returns, advantages, priority, *coefficients)
+
+    original_training = policy.training
+    parameter_ids = tuple(id(parameter) for parameter in policy.parameters())
+    parameter_values = tuple(
+        parameter.detach().clone() for parameter in policy.parameters())
+    cpu_rng = torch.random.get_rng_state().clone()
+    accelerator_rng = (
+        torch.mps.get_rng_state().clone()
+        if device.type == 'mps' else None)
+    policy.zero_grad(set_to_none=True)
+    synchronize(device)
+    try:
+        policy.train()
+        reference = _ppo_train_outputs(policy_forward, *inputs)
+        reference[-1].backward()
+        synchronize(device)
+        reference = tuple(value.detach().clone() for value in reference)
+        reference_grads = tuple(
+            parameter.grad.detach().clone()
+            for parameter in policy.parameters())
+        reference_norm = torch.nn.utils.clip_grad_norm_(
+            policy.parameters(), max_grad_norm).detach().clone()
+        reference_clipped = tuple(
+            parameter.grad.detach().clone()
+            for parameter in policy.parameters())
+        policy.zero_grad(set_to_none=True)
+
+        candidate = compiled_ppo(*inputs)
+        candidate[-1].backward()
+        synchronize(device)
+        candidate = tuple(value.detach().clone() for value in candidate)
+        candidate_grads = tuple(
+            parameter.grad.detach().clone()
+            for parameter in policy.parameters())
+        candidate_norm = torch.nn.utils.clip_grad_norm_(
+            policy.parameters(), max_grad_norm).detach().clone()
+        candidate_clipped = tuple(
+            parameter.grad.detach().clone()
+            for parameter in policy.parameters())
+        synchronize(device)
+
+        output_contract = (
+            len(reference) == len(candidate)
+            and all(
+                expected.shape == actual.shape
+                and expected.dtype == actual.dtype
+                and torch.isfinite(expected).all()
+                and torch.isfinite(actual).all()
+                and torch.allclose(
+                    expected, actual, rtol=2e-5, atol=2e-6)
+                for expected, actual in zip(reference, candidate))
+        )
+        gradient_contract = (
+            len(reference_grads) == len(candidate_grads)
+            and all(
+                torch.isfinite(expected).all()
+                and torch.isfinite(actual).all()
+                and torch.allclose(
+                    expected, actual, rtol=5e-5, atol=5e-6)
+                for expected, actual in zip(
+                    reference_grads, candidate_grads))
+            and torch.allclose(
+                reference_norm, candidate_norm, rtol=5e-5, atol=5e-6)
+            and all(torch.allclose(
+                    expected, actual, rtol=5e-5, atol=5e-6)
+                for expected, actual in zip(
+                    reference_clipped, candidate_clipped))
+        )
+        invariant_contract = (
+            tuple(id(parameter) for parameter in policy.parameters())
+                == parameter_ids
+            and all(torch.equal(before, after)
+                for before, after in zip(
+                    parameter_values, policy.parameters()))
+            and torch.equal(torch.random.get_rng_state(), cpu_rng)
+            and (accelerator_rng is None or torch.equal(
+                torch.mps.get_rng_state(), accelerator_rng))
+        )
+        if not (output_contract and gradient_contract and invariant_contract):
+            raise RuntimeError(
+                'compiled PPO preflight violated output, FP32-gradient, '
+                'Parameter-identity, or RNG invariants')
+    finally:
+        policy.zero_grad(set_to_none=True)
+        policy.train(original_training)
+        torch.random.set_rng_state(cpu_rng)
+        if accelerator_rng is not None:
+            torch.mps.set_rng_state(accelerator_rng)
+
+
+def configure_ppo_compile(args, policy, device, amp_dtype,
+        policy_compile_effective):
+    """Optionally fuse the validated FP32 policy and supplied-action PPO loss.
+
+    This is an additive optimization. Any setup failure retains the already
+    validated compiled-policy-only path, including for an explicit core policy
+    compiler request.
+    """
+    requested = str(
+        args.get('torch', {}).get('compile_ppo', 'off')).strip().lower()
+    if requested not in ('off', 'auto', 'inductor'):
+        raise ValueError(
+            'torch.compile_ppo must be off, auto, or inductor')
+    if requested == 'off':
+        return (None, requested, 'off', 'PPO compiler is disabled by configuration',
+            0.0, False, False)
+    if policy_compile_effective != 'inductor':
+        reason = 'validated compiled-policy path is inactive'
+        if requested == 'auto':
+            return (None, requested, 'off', reason,
+                0.0, False, False)
+        raise ValueError(
+            'torch.compile_ppo=inductor requires the validated FP32 '
+            f'compiled-policy path: {reason}')
+    if amp_dtype is not None:
+        reason = 'fused PPO graph is validated only for FP32'
+        if requested == 'auto':
+            return (None, requested, 'off', reason,
+                0.0, False, False)
+        raise ValueError(
+            'torch.compile_ppo=inductor requires the validated FP32 '
+            f'compiled-policy path: {reason}')
+    total_timesteps = int(args.get('train', {}).get('total_timesteps', 0))
+    if (requested == 'auto'
+            and total_timesteps
+                < _VALIDATED_PPO_COMPILE_BREAK_EVEN_TIMESTEPS):
+        return (None, requested, 'off',
+            f'configured total_timesteps {total_timesteps} is below the '
+            f'measured {_VALIDATED_PPO_COMPILE_BREAK_EVEN_TIMESTEPS}-step '
+            'compiled-PPO break-even; use inductor to force cold setup',
+            0.0, False, False)
+
+    attempt_started = time.perf_counter()
+    compiled_policy_forward = policy.forward
+    original_forward = getattr(
+        compiled_policy_forward, '_torchdynamo_orig_callable', None)
+    if original_forward is None:
+        reason = (
+            'compiled policy forward does not expose its original callable')
+        startup_seconds = time.perf_counter() - attempt_started
+        if requested == 'auto':
+            return (None, requested, 'off', reason,
+                startup_seconds, False, False)
+        raise RuntimeError(
+            'failed to configure the validated FP32 compiled PPO graph: '
+            + reason)
+
+    config = args['train']
+    coefficients = (
+        config['clip_coef'], config['vf_clip_coef'],
+        config['vf_coef'], config['ent_coef'])
+
+    def full_ppo(*inputs):
+        return _ppo_train_outputs(original_forward, *inputs)
+
+    try:
+        compiled_ppo = torch.compile(
+            full_ppo,
+            backend='inductor',
+            fullgraph=True,
+            dynamic=False,
+            options={'layout_optimization': False},
+        )
+        if (compiled_ppo is full_ppo
+                or getattr(compiled_ppo, '_torchdynamo_orig_callable', None)
+                    is not full_ppo):
+            raise RuntimeError(
+                'torch.compile did not produce a Dynamo PPO wrapper')
+        _preflight_ppo_compile(
+            compiled_ppo,
+            compiled_policy_forward,
+            policy,
+            device,
+            config['horizon'],
+            config['minibatch_size'],
+            policy.encoder.encoder.in_features,
+            coefficients,
+            config['max_grad_norm'],
+        )
+    except Exception as exc:
+        startup_seconds = time.perf_counter() - attempt_started
+        if requested == 'auto':
+            return (None, requested, 'off',
+                f'compile/preflight failed: {type(exc).__name__}: {exc}',
+                startup_seconds, False, False)
+        raise RuntimeError(
+            'failed to configure the validated FP32 compiled PPO graph') \
+            from exc
+
+    return (compiled_ppo, requested, 'inductor',
+        'validated FP32 policy + supplied-action PPO fullgraph; '
+        'trainer coefficients supplied as graph inputs; '
+        'tolerance-based output/backward and exact RNG preflight passed; '
+        'not bitwise trajectory parity; layout_optimization=False',
+        time.perf_counter() - attempt_started, True, True)
 
 
 def configure_rollout_sampler(args, vec, device, rollout_device, amp_dtype,
@@ -527,7 +1043,8 @@ def configure_rollout_sampler(args, vec, device, rollout_device, amp_dtype,
             'rollout device is not MPS'),
         (torch.device(device) == torch.device(rollout_device),
             'training and rollout devices differ'),
-        (amp_dtype is None, 'AMP is enabled'),
+        (amp_dtype in (None, torch.bfloat16),
+            'AMP dtype is not float32 or bfloat16'),
         (bool(mps_host_alias_io), 'MPS host aliasing is inactive'),
         (not bool(getattr(vec, 'gpu', False)),
             'native vector backend is not CPU'),
@@ -761,25 +1278,45 @@ class PuffeRL:
                 lambda value: value.to(self.amp_dtype)
                     if value.is_floating_point() else value)
 
+        policy_compile, mingru_scan = (
+            configure_policy_and_mingru_train_scan(
+                args,
+                vec,
+                self.policy,
+                device,
+                rollout_device,
+                self.amp_dtype,
+                self.mps_host_alias_io,
+                self.state,
+            ))
         (self.policy_compile_requested,
          self.policy_compile_effective,
          self.policy_compile_reason,
          self.policy_compile_startup_seconds,
-         self.policy_compile_preflight) = configure_policy_compile(
-            args,
-            vec,
-            self.policy,
-            device,
-            rollout_device,
-            self.amp_dtype,
-            self.mps_host_alias_io,
-            self.state,
-        )
+         self.policy_compile_preflight) = policy_compile
+        (self.mingru_train_scan_requested,
+         self.mingru_train_scan_effective,
+         self.mingru_train_scan_reason,
+         self.mingru_train_scan_startup_seconds,
+         self.mingru_train_scan_preflight) = mingru_scan
         # Successful configuration cannot reach this state without both
         # verified Dynamo wrappers and the full eval/train/backward preflight.
         self.policy_compile_wrapper_verified = bool(
             self.policy_compile_effective == 'inductor'
             and self.policy_compile_preflight)
+        (self.compiled_ppo,
+         self.ppo_compile_requested,
+         self.ppo_compile_effective,
+         self.ppo_compile_reason,
+         self.ppo_compile_startup_seconds,
+         self.ppo_compile_preflight,
+         self.ppo_compile_wrapper_verified) = configure_ppo_compile(
+            args,
+            self.policy,
+            device,
+            self.amp_dtype,
+            self.policy_compile_effective,
+        )
         (self.rollout_sampler,
          self.rollout_sampler_requested,
          self.rollout_sampler_effective,
@@ -795,7 +1332,9 @@ class PuffeRL:
             self.policy_compile_effective,
         )
         self.optimization_startup_seconds = (
-            self.policy_compile_startup_seconds
+            self.mingru_train_scan_startup_seconds
+            + self.policy_compile_startup_seconds
+            + self.ppo_compile_startup_seconds
             + self.rollout_sampler_startup_seconds)
 
         self.batch_size = total_agents * horizon
@@ -1016,17 +1555,34 @@ class PuffeRL:
             mb_advantages = advantages[idx]
 
             prof.mark(1)
-            with self._autocast(device):
-                logits, newvalue = self.policy(mb_obs)
-            logits = _float_policy_output(logits)
-            newvalue = newvalue.float()
-            actions, newlogprob, entropy = sample_logits(logits, action=mb_actions)
+            if self.compiled_ppo is None:
+                with self._autocast(device):
+                    logits, newvalue = self.policy(mb_obs)
+                logits = _float_policy_output(logits)
+                newvalue = newvalue.float()
+                _, newlogprob, entropy = sample_logits(
+                    logits, action=mb_actions)
+                newlogprob = newlogprob.reshape(mb_logprobs.shape)
+                logratio = newlogprob - mb_logprobs
+                ratio = logratio.exp()
+            else:
+                (_, newvalue, _, _, logratio, ratio,
+                 pg_loss, v_loss, entropy_loss, loss) = self.compiled_ppo(
+                    mb_obs,
+                    mb_actions,
+                    mb_logprobs,
+                    mb_values,
+                    mb_returns,
+                    mb_advantages,
+                    mb_prio,
+                    clip_coef,
+                    vf_clip,
+                    config['vf_coef'],
+                    config['ent_coef'],
+                )
             prof.mark(2)
             prof.elapsed(P.TRAIN_FORWARD, 1, 2)
 
-            newlogprob = newlogprob.reshape(mb_logprobs.shape)
-            logratio = newlogprob - mb_logprobs
-            ratio = logratio.exp()
             self.ratio[idx] = ratio.detach()
 
             with torch.no_grad():
@@ -1034,21 +1590,27 @@ class PuffeRL:
                 approx_kl = ((ratio - 1) - logratio).mean()
                 clipfrac = ((ratio - 1.0).abs() > config['clip_coef']).float().mean()
 
-            adv = mb_advantages
-            adv = mb_prio * (adv - adv.mean()) / (adv.std() + 1e-8)
+            if self.compiled_ppo is None:
+                adv = mb_advantages
+                adv = mb_prio * (adv - adv.mean()) / (adv.std() + 1e-8)
+                pg_loss1 = -adv * ratio
+                pg_loss2 = -adv * torch.clamp(
+                    ratio, 1 - clip_coef, 1 + clip_coef)
+                pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
-            pg_loss1 = -adv * ratio
-            pg_loss2 = -adv * torch.clamp(ratio, 1 - clip_coef, 1 + clip_coef)
-            pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+                newvalue = newvalue.view(mb_returns.shape)
+                v_clipped = mb_values + torch.clamp(
+                    newvalue - mb_values, -vf_clip, vf_clip)
+                v_loss_unclipped = (newvalue - mb_returns) ** 2
+                v_loss_clipped = (v_clipped - mb_returns) ** 2
+                v_loss = 0.5*torch.max(
+                    v_loss_unclipped, v_loss_clipped).mean()
 
-            newvalue = newvalue.view(mb_returns.shape)
-            v_clipped = mb_values + torch.clamp(newvalue - mb_values, -vf_clip, vf_clip)
-            v_loss_unclipped = (newvalue - mb_returns) ** 2
-            v_loss_clipped = (v_clipped - mb_returns) ** 2
-            v_loss = 0.5*torch.max(v_loss_unclipped, v_loss_clipped).mean()
+                entropy_loss = entropy.mean()
+                loss = (
+                    pg_loss + config['vf_coef']*v_loss
+                    - config['ent_coef']*entropy_loss)
 
-            entropy_loss = entropy.mean()
-            loss = pg_loss + config['vf_coef']*v_loss - config['ent_coef']*entropy_loss
             val[idx] = newvalue.detach().float()
 
             # Metrics must not retain a chain of completed autograd graphs
