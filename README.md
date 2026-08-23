@@ -25,7 +25,9 @@ Device selection is automatic. Calibrated environment/model pairs can keep
 large rollout batches on MPS; uncalibrated pairs use a CPU actor and transfer
 each completed horizon to MPS once. Use `--torch.rollout-device cpu` or
 `--torch.rollout-device mps` to override it. Float32 is the correctness
-default; BF16 is opt-in for direct-MPS rollouts.
+default. BF16 is an explicit experimental opt-in: its execution-contract and
+semantic gates pass, but its preregistered 10-seed promotion gate narrowly
+failed, so it is not selected automatically.
 
 Run the documented 4,096-agent direct-MPS workload with:
 
@@ -33,22 +35,39 @@ Run the documented 4,096-agent direct-MPS workload with:
 PYTORCH_ENABLE_MPS_FALLBACK=0 python benchmarks/apple_silicon.py \
   --env breakout --agents 4096 --horizon 64 --minibatch-size 65536 \
   --threads 18 --torch-threads 12 --torch-interop-threads 1 \
-  --warmup-epochs 3 --epochs 11 --compile-policy auto --modes mps
+  --warmup-epochs 3 --epochs 11 --compile-policy auto \
+  --compile-ppo off --mingru-train-scan off --modes mps
 ```
 
-On the target 20-GPU-core M5 Pro, two production runs of the guarded compiled
-FP32 path with its fused Metal/Philox rollout sampler measured 2,094,181 and
-2,091,980 agent steps/s. The representative ~2.093M result is 4.58x the tuned
-CPU path, 2.47x the CPU-rollout/MPS-learner path, and 1.70x eager MPS on the
-documented 4,096-agent Breakout workload. A provenance-checked 10-seed learning
-holdout passed the predeclared tail-score, learning-AUC, steps-to-score,
-finiteness, and full-run wall-time gates against eager MPS. Compiler and sampler
-startup were included: steps-to-score matched, median early wall-clock
-milestones were slower because of cold startup, and the complete 32-epoch runs
-were 1.2468x faster. The full shared suite reports 214 passed, 25 explicitly skipped, and no
-failures. Other hardware, shapes, and policies stay eager. This is a same-Mac
-comparison; CUDA parity remains unclaimed until the harness's `--modes cuda`
-path is run on a named NVIDIA host.
+The quality-safe Breakout default is the guarded compiled FP32 policy with its
+fused Metal/Philox rollout sampler. On the target 20-GPU-core M5 Pro, two
+production runs measured 2,094,181 and 2,091,980 agent steps/s. The
+representative ~2.093M result is 4.58x the tuned CPU path, 2.47x the
+CPU-rollout/MPS-learner path, and 1.70x eager MPS on the documented
+4,096-agent workload. A provenance-checked 10-seed learning holdout passed its
+predeclared quality and full-run wall-time gates against eager MPS.
+
+A faster experimental stack adds a compiled supplied-action PPO graph and a
+training-only Metal MinGRU scan. It reached a 2.207M-step/s median over the
+complete 93,847,552-step workload versus 1.719M for its quality-safe baseline;
+the median paired speed ratio was 1.2904x. It failed the preregistered
+learning-quality gate: tail score was 0.9866x its baseline, but its bootstrap
+lower guard was only 0.6509; learning AUC was 0.6751x (0.5351 lower guard), and
+score-4 took 1.0769x as many steps. All runs remained finite and passed identity
+and no-recompile checks. Breakout therefore keeps `torch.compile_ppo=off` and
+`torch.mingru_train_scan=off`; nonmatching or failed explicit requests fail
+closed, and `auto` falls back to the promoted compiled-policy path.
+
+There is online CUDA context, but not a controlled parity result. PufferLib's
+[official documentation](https://puffer.ai/docs.html) reports a 20M-step/s
+native headline and a 3–5 second Breakout run on an RTX 5090. That headline is
+about 11.6x the 93,847,552-step MPS baseline or 9.6x the short
+~2.093M MPS result. The official
+[experiments release](https://github.com/PufferAI/PufferLib/releases/tag/experiments)
+contains raw Breakout runs, but it does not identify each run's GPU, commit,
+precision, or equivalent timing boundary. Native CUDA and Torch/MPS also use
+different machinery, so CUDA is clearly faster in the published results while
+a same-commit Torch-CUDA-versus-MPS ratio remains unproven.
 
 See [APPLE_SILICON.md](APPLE_SILICON.md) for architecture, validation, and
 benchmark guidance.

@@ -20,7 +20,7 @@ machine's unified-memory CPU/GPU architecture:
   API is absent, rejects an allocation, or is disabled with
   `--torch.mps-host-alias off`, the trainer automatically uses ordinary
   synchronized staged copies.
-- Breakout's exact validated FP32 shape can compile its rollout and learner
+- Breakout's exact promoted FP32 shape can compile its rollout and learner
   policy methods with MPS Inductor. This is deliberately a machine-specific
   promotion, not a broad `torch.compile` claim. The complete identity guard is
   PyTorch 2.13.0 at git revision
@@ -28,7 +28,8 @@ machine's unified-memory CPU/GPU architecture:
   Pro with 20 GPU cores and 24 GiB unified memory, and macOS 27.0 build
   26A5378j. The workload guard pins Breakout, 4,096 agents, 118 observations,
   one categorical action head of size 3, horizon 64, minibatch 65,536, the
-  2x64 MinGRU policy with 32,452 parameters, direct FP32 MPS, a CPU vector
+  2x64 MinGRU policy with 32,452 parameters, direct MPS, FP32 by default (or
+  explicit experimental BF16 autocast), a CPU vector
   backend, one distributed rank, active host aliasing, and
   `PYTORCH_ENABLE_MPS_FALLBACK=0`.
 - The compiler also pins the validated policy classes and their unmodified
@@ -53,15 +54,31 @@ machine's unified-memory CPU/GPU architecture:
   closed. The fused sampler is limited to the validated compiled Breakout
   rollout. Eager, other discrete or multidiscrete shapes, Normal policies, and
   supplied-action evaluation retain their existing sampling paths.
+- Two additional exact-shape optimizations are available only as experiments.
+  `torch.compile_ppo` fuses the FP32 supplied-action policy and PPO loss, while
+  `torch.mingru_train_scan` replaces only the training recurrence with a
+  custom Metal forward/backward operation; evaluation retains the portable
+  recurrence. Both require the validated M5 Pro FP32 compiled-policy identity
+  and full preflight. The PPO preflight uses tight numerical tolerances while
+  preserving Parameter, optimizer, and RNG identity; it does not claim bitwise
+  trajectory equivalence. `auto` returns to the promoted compiled-policy-only
+  path on a guard, setup, wrapper, or preflight mismatch; explicit
+  `inductor`/`metal` requests fail closed. The PPO `auto` mode also stays off
+  below its measured 54.8-million-step cold-start break-even. Neither
+  optimization is enabled in Breakout because their combined preregistered
+  production-length learning holdout failed its quality gates.
 - Persistent rollout storage stays contiguous and time-major before exposing an
   agent-major strided view. Direct MPS therefore does not duplicate the full
   horizon, and hybrid mode avoids a redundant source-device contiguous copy;
   only selected minibatches are materialized agent-major.
 - Policy math can use BF16 autocast, while PPO statistics, advantages, losses,
-  and optimizer state stay in FP32. FP32 remains the default because it is the
-  numerical-parity baseline. BF16 has not yet passed a time-to-score or
-  convergence comparison and should be treated as an experimental throughput
-  option.
+  Parameters, gradients, and optimizer state stay in FP32. FP32 remains the
+  promoted default. BF16 passed a 64-step cross-precision semantic gate, but
+  its preregistered 10-seed/32-epoch promotion holdout narrowly failed the
+  tail-score bootstrap floor (0.89927 versus 0.90) and score-4 step ceiling
+  (1.05556 versus 1.05). It remains an explicit experimental throughput option;
+  the observed seeds are locked and no production-length promotion run is
+  enabled.
 - Craftax keeps its compact 843-value native transport, but the policy expands
   it algebraically to the exact 8,268-value symbolic one-hot projection. Its
   canonical Linear parameter and Muon update geometry match the pre-port
@@ -140,7 +157,13 @@ puffer train breakout --torch.compile-policy off
 PYTORCH_ENABLE_MPS_FALLBACK=0 puffer train breakout \
   --torch.compile-policy inductor
 
-# Opt into BF16 policy autocast
+# Investigate the unpromoted PPO + Metal MinGRU stack (fail closed)
+PYTORCH_ENABLE_MPS_FALLBACK=0 puffer train breakout \
+  --torch.compile-policy inductor \
+  --torch.compile-ppo inductor \
+  --torch.mingru-train-scan metal
+
+# Opt into experimental BF16 policy autocast
 puffer train breakout --torch.amp-dtype bfloat16
 
 # Deliberate CPU-only reference
@@ -177,11 +200,9 @@ The final M5 Pro validation built and imported all 61 native bindings. All 58
 constructible environments passed reset, one complete zero-action step,
 ABI/shape/dtype/finiteness/log checks, and clean close; Scape and Tactical were
 the two expected fail-closed prototypes, and Drive was the sole fixture skip
-because its generated map binary is not checked in. The final Breakout-backed
-shared collection reported 214 passed, 25 explicitly skipped, zero failures,
-and no collection errors. Extension-specific suites were also run immediately
-after their matching native builds, including Craftax's 16-seed x 2,000-step
-JAX trajectory parity test.
+because its generated map binary is not checked in. Extension-specific suites
+were also run immediately after their matching native builds, including
+Craftax's 16-seed x 2,000-step JAX trajectory parity test.
 
 CUDA-only and optional research tests are explicitly reported as skipped when
 their hardware, toolkit, or datasets are unavailable. They are not silently
@@ -219,7 +240,8 @@ Each JSON result includes every raw epoch sample, the effective Torch/train/
 vector/environment configuration, alias/fallback/compiler state, hardware and
 OS identity, extension precision, Git revision, and a source-patch SHA-256
 fingerprint. Compiler and fused-sampler startup are excluded from the
-steady-state table but included in the isolated learning holdout:
+steady-state table but included in the isolated learning holdout. The canonical
+command explicitly keeps both unpromoted optimizations off:
 
 ```bash
 ./build.sh breakout --mps
@@ -234,6 +256,24 @@ PYTORCH_ENABLE_MPS_FALLBACK=0 python benchmarks/apple_silicon.py \
   --warmup-epochs 3 \
   --epochs 11 \
   --compile-policy auto \
+  --compile-ppo off \
+  --mingru-train-scan off \
+  --modes mps
+
+# Experimental throughput only; this combined stack failed its quality gate
+PYTORCH_ENABLE_MPS_FALLBACK=0 python benchmarks/apple_silicon.py \
+  --env breakout \
+  --agents 4096 \
+  --horizon 64 \
+  --minibatch-size 65536 \
+  --threads 18 \
+  --torch-threads 12 \
+  --torch-interop-threads 1 \
+  --warmup-epochs 3 \
+  --epochs 11 \
+  --compile-policy inductor \
+  --compile-ppo inductor \
+  --mingru-train-scan metal \
   --modes mps
 
 # Reproduce the tuned CPU row from the 1/6/12/18 intra-op thread sweep
@@ -290,7 +330,7 @@ reference rows used 18:
 | CPU rollout + CPU learner | FP32 | 12 | 11 | 456,786 | 431,849–462,090 |
 | CPU rollout + MPS learner | FP32 | 18 | 11 | 846,656 | 825,547–858,530 |
 | MPS rollout + MPS learner (eager) | FP32 | 18 | 11 | 1,232,524 | 1,209,814–1,247,203 |
-| MPS rollout + MPS learner (compiled + fused sampler, primary) | FP32 | 12 | 11 | **2,094,181** | **1,937,189–2,129,181** |
+| MPS rollout + MPS learner (compiled + fused sampler, quality-safe primary) | FP32 | 12 | 11 | **2,094,181** | **1,937,189–2,129,181** |
 | MPS rollout + MPS learner (compiled + fused sampler, repeat) | FP32 | 12 | 11 | **2,091,980** | **1,957,241–2,182,506** |
 | MPS rollout + MPS learner | BF16 autocast | 18 | 11 | 1,253,506 | 1,182,212–1,287,415 |
 
@@ -299,9 +339,15 @@ steps/s, 0.18% below its table median. The two independent production
 compiled-plus-fused medians give a representative result of approximately
 2.093M steps/s: 4.58x the tuned 456,786-step/s CPU baseline, 2.47x the
 846,656-step/s hybrid path, and 1.70x the earlier 1,232,524-step/s eager MPS
-row for this workload. BF16 remains experimental because it has not passed a
-time-to-score comparison and is deliberately excluded from the compiler guard.
-These are local end-to-end training-loop measurements, not a CUDA comparison.
+row for this workload. BF16 remains experimental because its preregistered
+promotion holdout failed; the exact compiler can execute it only when requested
+explicitly. These are local end-to-end training-loop measurements, not a CUDA
+comparison.
+
+A final explicit-off confirmation of the quality-safe command measured
+2,074,556 steps/s (1,770,659–2,124,264) across 11 epochs, including one rollout
+outlier. The two independent canonical medians above remain the representative
+short-run result rather than replacing them with that single noisier repeat.
 
 The sampler itself was promoted through a controlled alternating ABBA test
 against `torch.multinomial`. The full epoch digest was exact across rollout
@@ -365,6 +411,62 @@ PYTORCH_ENABLE_MPS_FALLBACK=0 python \
   benchmarks/compile_policy_holdout.py
 ```
 
+The later combined PPO-plus-MinGRU experiment did not pass promotion. Its
+preregistered holdout paired five previously unseen seeds
+(`233,239,241,251,257`) for 358 epochs each: 93,847,552 complete steps per run,
+with fresh processes, alternating pair order, unique empty compiler caches, and
+optimization startup included. The candidate added compiled PPO and the Metal
+MinGRU training scan to the quality-safe compiled-policy/fused-sampler baseline.
+Its median throughput was 2,207,095.8 steps/s versus 1,719,403.6, and its median
+paired measured speed ratio was `1.290406x`. All runs passed finiteness, exact
+configuration and object identity, and zero-post-preflight-recompile checks. It
+nevertheless failed the fixed learning gates:
+
+| Candidate / quality-safe baseline metric | Result | Required |
+|---|---:|---:|
+| Median tail-score ratio | 0.986635 | >= 0.95 |
+| Tail-score 90% bootstrap lower guard | 0.650948 | >= 0.90 |
+| Median learning-curve AUC ratio | 0.675094 | >= 0.95 |
+| AUC 90% bootstrap lower guard | 0.535086 | >= 0.90 |
+| Sustained score-4 step ratio | 1.076923 | <= 1.05 |
+| Median measured training speedup | 1.290406x | >= 1.0x |
+
+Breakout therefore keeps both controls off. The immutable inputs are in
+`benchmarks/optimized_holdout_protocol.json`, and the locked outcome is in
+`benchmarks/optimized_holdout_result.json`. Validate the locked protocol and
+result with:
+
+```bash
+PYTORCH_ENABLE_MPS_FALLBACK=0 python benchmarks/optimized_holdout.py --validate-only
+```
+
+Rerunning these now-observed seeds cannot reverse the failed promotion; a future
+attempt requires a new preregistered protocol and new seeds. The normal runner
+therefore refuses to overwrite or rerun this terminal result.
+
+The separate BF16 experiment did not pass promotion. Its fixed-input semantic
+gate used 64 pairwise-distinct observation slices and fixed supplied actions.
+Compiled FP32 versus compiled BF16 produced mean categorical KL `1.64e-7`,
+step-64 value/state normalized RMSE `0.00211/0.00200`, gradient cosine
+`0.999998`, and global clipped-Muon-update cosine `0.996257`; all dtype and
+finiteness contracts passed. The subsequent preregistered holdout used ten new
+paired seeds (`127,131,137,139,149,151,157,163,167,173`) and 32 epochs per
+replicate. Its median AUC ratio was `0.99967`, tail ratio `1.01516`, and the
+startup-inclusive measured-training clock was `1.10101x` faster, while
+steady-state epoch timing was about `1.168x` faster. It nevertheless failed two
+fixed quality gates: the tail bootstrap lower bound was `0.8992736` (required
+`0.90`) and the score-4 step ratio was `1.0555556` (maximum `1.05`). The compact
+durable result and source-report SHA-256 are stored in
+`benchmarks/bf16_holdout_result.json`; reproduce the semantic gate with:
+
+```bash
+PYTORCH_ENABLE_MPS_FALLBACK=0 TORCHINDUCTOR_LAYOUT_OPTIMIZATION=0 \
+  python benchmarks/bf16_semantic_gate.py
+```
+
+Rerunning the now-observed BF16 holdout seeds cannot reverse that decision.
+Any future promotion attempt needs a new preregistered profile and new seeds.
+
 PyTorch MPS does not provide a deterministic `scatter_reduce` backward for this
 model. The MPS arms therefore use fixed RNG seeds plus paired multi-seed
 statistics rather than falsely claiming bitwise deterministic training.
@@ -404,18 +506,32 @@ Metal recommended maximum was 17.76 GiB. The 8,192 default retains substantial
 headroom for the native Craftax state, the OS, and other applications while
 also giving the best sustained result in this sweep.
 
-Raw throughput from an NVIDIA GPU is not an apples-to-apples acceptance target
-for a Mac that cannot run CUDA. Compare CUDA and MPS only with the same commit,
-environment, model, precision, agent count, horizon, minibatch, replay ratio,
-seed, warmup policy, and timing boundaries. Also check convergence or
-time-to-score: steps per second alone does not establish training equivalence.
-No NVIDIA device was available for this port, so CUDA parity is deliberately
-left unclaimed until that controlled run is performed on a named CUDA host.
-The harness supports that portable-path run directly: build the float32 CUDA
-extension with `./build.sh breakout --float`, then use the same command above
-with `--modes cuda`. The repository's monolithic native-CUDA backend should be
-reported separately because it has different rollout/storage machinery. The
-portable launch path now resolves indexed CUDA devices before native vector
-allocation and supports both internal multi-GPU spawning and external
-`torchrun`; mocked routing/DDP tests pass here, but a real two-GPU epoch remains
-part of the named-NVIDIA acceptance run.
+### Online CUDA comparison
+
+Official online results provide useful CUDA context. PufferLib's
+[official documentation](https://puffer.ai/docs.html) reports a 20M-step/s
+native headline and names an RTX 5090 for a 3–5 second Breakout result. That
+headline is about 11.6x the production-length quality-safe MPS baseline median
+of 1,719,403.6, or 9.6x the representative short MPS result of about 2.093M.
+The official
+[experiments release](https://github.com/PufferAI/PufferLib/releases/tag/experiments)
+contains raw Breakout runs consistent with this scale, but the archive does not
+identify each run's GPU or provide enough provenance to select a same-hardware,
+same-commit subset without bias.
+
+This comparison is not same-commit or device-only: the documented native CUDA
+path uses BF16 by default and different environment placement, graphs, rollout,
+storage, and timing machinery from this Torch/MPS path. It establishes that the
+published native-CUDA result is faster in raw throughput; it does not establish
+a Torch-CUDA-versus-MPS ratio.
+
+A controlled comparison still needs the same commit, environment, model,
+precision, agent count, horizon, minibatch, replay ratio, seed, warmup policy,
+timing boundaries, and convergence or time-to-score checks. No NVIDIA device
+was available locally for this port. The harness supports a portable-path run:
+build the float32 CUDA extension with `./build.sh breakout --float`, then use
+the canonical command above with `--modes cuda`. Report the repository's
+monolithic native-CUDA backend separately. The portable launch path resolves
+indexed CUDA devices before native vector allocation and supports both internal
+multi-GPU spawning and external `torchrun`; mocked routing/DDP tests pass here,
+but a real two-GPU epoch remains part of a future named-NVIDIA acceptance run.
