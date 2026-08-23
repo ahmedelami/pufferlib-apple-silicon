@@ -19,9 +19,9 @@ int main() {
 
     // Allocate these manually since they aren't being passed from Python
     env.observations = calloc(env.num_agents*num_obs, sizeof(float));
-    env.actions = calloc(env.num_agents, sizeof(double));
+    env.actions = calloc(env.num_agents, sizeof(float));
     env.rewards = calloc(env.num_agents, sizeof(float));
-    env.terminals = calloc(env.num_agents, sizeof(double));
+    env.terminals = calloc(env.num_agents, sizeof(float));
 
     // Always call reset and render first
     c_reset(&env);
@@ -46,4 +46,3 @@ int main() {
     free(env.terminals);
     c_close(&env);
 }
-

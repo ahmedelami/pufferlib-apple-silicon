@@ -63,9 +63,9 @@ typedef struct Tactical {
     Client* client;
     int num_agents;
     unsigned char* observations;
-    int* actions;
+    float* actions;
     float* rewards;
-    unsigned char* terminals;
+    float* terminals;
     unsigned char* truncations;
 
     unsigned int n_entities;
@@ -84,6 +84,7 @@ typedef struct Tactical {
 
     unsigned int* movement_path;
     int* movement_distance;
+    unsigned int rng;
 } Tactical;
 
 // Entity (player, summoned creature...)
@@ -1317,4 +1318,18 @@ void close_client(Client* client) {
     CloseWindow();
     free(client->movement_cells);
     free(client);
+}
+
+void c_close(Tactical* env) {
+    if (env->client != NULL) {
+        close_client(env->client);
+    }
+    for (unsigned int i = 0; i < env->n_entities; i++) {
+        free(env->entities[i].spells);
+    }
+    free(env->cell_to_entity);
+    free(env->map);
+    free(env->movement_path);
+    free(env->movement_distance);
+    free(env->entities);
 }

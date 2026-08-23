@@ -43,9 +43,9 @@ typedef struct {
   Agent *agents;
   Factory *factories;
   float *observations;
-  int *actions;
+  float *actions;
   float *rewards;
-  unsigned char *terminals;
+  float *terminals;
   int width;
   int height;
   int num_agents;
@@ -53,6 +53,7 @@ typedef struct {
   int num_resources;
   int equidistant;
   int radius;
+  unsigned int rng;
 } ConvertCircle;
 
 static inline float random_float(float low, float high) {

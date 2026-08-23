@@ -18,9 +18,9 @@ int main() {
 
   int num_obs = 2 * env.num_resources + 4 + env.num_resources;
   env.observations = calloc(env.num_agents * num_obs, sizeof(float));
-  env.actions = calloc(2 * env.num_agents, sizeof(int));
+  env.actions = calloc(2 * env.num_agents, sizeof(float));
   env.rewards = calloc(env.num_agents, sizeof(float));
-  env.terminals = calloc(env.num_agents, sizeof(unsigned char));
+  env.terminals = calloc(env.num_agents, sizeof(float));
 
   Weights *weights =
       load_weights("resources/convert/convert_weights.bin");

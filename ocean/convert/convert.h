@@ -43,7 +43,7 @@ typedef struct {
     Agent* agents;
     Factory* factories;
     float* observations;
-    double* actions;
+    float* actions;
     float* rewards;
     float* terminals;
     int num_agents;
@@ -51,6 +51,7 @@ typedef struct {
     int height;
     int num_factories;
     int num_resources;
+    unsigned int rng;
 } Convert;
 
 void init(Convert* env) {

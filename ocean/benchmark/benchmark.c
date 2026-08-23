@@ -28,7 +28,7 @@ int main(int argc, char** argv) {
            num_envs, threads, compute, bandwidth);
 
     unsigned char* observations = (unsigned char*)calloc(num_envs*bandwidth, sizeof(unsigned char));
-    double* actions = (double*)calloc(num_envs, sizeof(double));
+    float* actions = (float*)calloc(num_envs, sizeof(float));
     float* rewards = (float*)calloc(num_envs, sizeof(float));
     float* terminals = (float*)calloc(num_envs, sizeof(float));
 

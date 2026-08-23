@@ -10,12 +10,13 @@ typedef struct {
 typedef struct {
     Log log;
     unsigned char* observations;
-    double* actions;
+    float* actions;
     float* rewards;
     float* terminals;
     int num_agents;
     int bandwidth;
     int compute;
+    unsigned int rng;
 } Benchmark;
 
 void c_reset(Benchmark* env) {}

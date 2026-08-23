@@ -2,8 +2,7 @@
 #define OBS_SIZE 28
 #define NUM_ATNS 2
 #define ACT_SIZES {9, 5}
-#define OBS_TYPE FLOAT
-#define ACT_TYPE DOUBLE
+#define OBS_TENSOR_T FloatTensor
 
 #define Env Convert
 #include "vecenv.h"

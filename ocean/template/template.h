@@ -16,12 +16,14 @@ typedef struct {
 typedef struct {
     Log log;                     // Required field
     unsigned char* observations; // Required field. Ensure type matches in .py and .c
-    int* actions;                // Required field. Ensure type matches in .py and .c
+    float* actions;              // Required field
     float* rewards;              // Required field
-    unsigned char* terminals;    // Required field
+    float* terminals;            // Required field
+    int num_agents;
     int size;
     int x;
     int goal;
+    unsigned int rng;
 } Template;
 
 void c_reset(Template* env) {

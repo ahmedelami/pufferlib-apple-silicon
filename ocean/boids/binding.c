@@ -1,24 +1,52 @@
 #include "boids.h"
 
-#define Env Boids
-#include "../env_binding.h"
+#define OBS_SIZE 256
+#define NUM_ATNS 2
+#define ACT_SIZES {5, 5}
+#define OBS_TENSOR_T FloatTensor
 
-static int my_init(Env* env, PyObject* args, PyObject* kwargs) {
-    env->num_boids = unpack(kwargs, "num_boids");
-    env->report_interval = unpack(kwargs, "report_interval");
-    env->margin_turn_factor = unpack(kwargs, "margin_turn_factor");
-    env->centering_factor = unpack(kwargs, "centering_factor");
-    env->avoid_factor = unpack(kwargs, "avoid_factor");
-    env->matching_factor = unpack(kwargs, "matching_factor");
-    init(env);
-    return 0;
+#define MY_VEC_VALIDATE boids_validate
+#define Env Boids
+#include "vecenv.h"
+
+static double kwarg_or(Dict* kwargs, const char* key, double fallback) {
+    DictItem* item = dict_get_unsafe(kwargs, key);
+    return item == NULL ? fallback : item->value;
 }
 
-static int my_log(PyObject* dict, Log* log) {
-    assign_to_dict(dict, "perf", log->perf);
-    assign_to_dict(dict, "score", log->score);
-    assign_to_dict(dict, "episode_return", log->episode_return);
-    assign_to_dict(dict, "episode_length", log->episode_length);
-    assign_to_dict(dict, "n", log->n);
-    return 0;
+int boids_validate(Dict* vec_kwargs, Dict* kwargs) {
+    int total_agents = (int)kwarg_or(vec_kwargs, "total_agents", 0);
+    int num_buffers = (int)kwarg_or(vec_kwargs, "num_buffers", 0);
+    int num_boids = (int)kwarg_or(kwargs, "num_boids", 64);
+    if (num_boids != 64) {
+        fprintf(stderr, "boids: static binding requires num_boids=64\n");
+        return 0;
+    }
+    if (total_agents < 1 || num_buffers < 1
+            || total_agents % num_boids != 0
+            || total_agents % num_buffers != 0
+            || (total_agents / num_buffers) % num_boids != 0) {
+        fprintf(stderr,
+            "boids: total_agents/buffers must divide into whole 64-boid environments\n");
+        return 0;
+    }
+    return 1;
+}
+
+void my_init(Env* env, Dict* kwargs) {
+    env->num_boids = kwarg_or(kwargs, "num_boids", 64);
+    env->num_agents = env->num_boids;
+    env->report_interval = kwarg_or(kwargs, "report_interval", 1);
+    env->margin_turn_factor = kwarg_or(kwargs, "margin_turn_factor", 1.0);
+    env->centering_factor = kwarg_or(kwargs, "centering_factor", 0.0);
+    env->avoid_factor = kwarg_or(kwargs, "avoid_factor", 0.0);
+    env->matching_factor = kwarg_or(kwargs, "matching_factor", 0.0);
+    init(env);
+}
+
+void my_log(Log* log, Dict* out) {
+    dict_set(out, "perf", log->perf);
+    dict_set(out, "score", log->score);
+    dict_set(out, "episode_return", log->episode_return);
+    dict_set(out, "episode_length", log->episode_length);
 }

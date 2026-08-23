@@ -1,14 +1,19 @@
 #include "template.h"
 
-#define Env Template 
-#include "../env_binding.h"
+#define OBS_SIZE 1
+#define NUM_ATNS 1
+#define ACT_SIZES {2}
+#define OBS_TENSOR_T ByteTensor
 
-static int my_init(Env* env, PyObject* args, PyObject* kwargs) {
-    env->size = unpack(kwargs, "size");
-    return 0;
+#define Env Template
+#include "vecenv.h"
+
+void my_init(Env* env, Dict* kwargs) {
+    DictItem* size = dict_get_unsafe(kwargs, "size");
+    env->num_agents = 1;
+    env->size = size == NULL ? 5 : (int)size->value;
 }
 
-static int my_log(PyObject* dict, Log* log) {
-    assign_to_dict(dict, "score", log->score);
-    return 0;
+void my_log(Log* log, Dict* out) {
+    dict_set(out, "score", log->score);
 }

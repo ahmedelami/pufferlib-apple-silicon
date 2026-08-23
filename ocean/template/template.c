@@ -3,9 +3,9 @@
 int main() {
     Template env = {.size = 5};
     env.observations = (unsigned char*)calloc(1, sizeof(unsigned char));
-    env.actions = (int*)calloc(1, sizeof(int));
+    env.actions = (float*)calloc(1, sizeof(float));
     env.rewards = (float*)calloc(1, sizeof(float));
-    env.terminals = (unsigned char*)calloc(1, sizeof(unsigned char));
+    env.terminals = (float*)calloc(1, sizeof(float));
 
     c_reset(&env);
     c_render(&env);

@@ -56,7 +56,8 @@ typedef struct {
     Entity* entities;
     Goal* goals;
     float* observations; // Required. You can use any obs type, but make sure it matches in Python!
-    double* actions; // Required. double* for discrete/multidiscrete, float* for box
+    float* actions;
+    unsigned int rng;
     float* rewards; // Required
     float* terminals; // Required. We don't yet have truncations as standard yet
     int width;

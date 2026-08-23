@@ -60,9 +60,10 @@ typedef struct {
 typedef struct {
   Log log;
   float *observations;
-  int *actions;
+  float *actions;
   float *rewards;
-  unsigned char *terminals;
+  float *terminals;
+  int num_agents;
   int size;
   Vector2 player_position;
   Vector2 player_vel;
@@ -78,6 +79,7 @@ typedef struct {
   int score;
   float episode_return;
   int frameskip;
+  unsigned int rng;
 } Asteroids;
 
 float random_float(float low, float high) {

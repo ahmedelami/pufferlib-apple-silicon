@@ -3,9 +3,9 @@
 int main() {
   Asteroids env = {.size = 500, .frameskip = 1};
   env.observations = (float *)calloc(4 + 2 * 50, sizeof(float));
-  env.actions = (int *)calloc(1, sizeof(int));
+  env.actions = (float *)calloc(1, sizeof(float));
   env.rewards = (float *)calloc(1, sizeof(float));
-  env.terminals = (unsigned char *)calloc(1, sizeof(unsigned char));
+  env.terminals = (float *)calloc(1, sizeof(float));
 
   c_reset(&env);
   c_render(&env);

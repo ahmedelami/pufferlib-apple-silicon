@@ -30,9 +30,10 @@ typedef struct {
 typedef struct {
   Log log;
   unsigned char *observations;
-  int *actions;
+  float *actions;
   float *rewards;
-  unsigned char *terminals;
+  float *terminals;
+  int num_agents;
   int size;
   int tick;
   int current_player;
@@ -42,6 +43,7 @@ typedef struct {
   int capture_available_valid;
   int game_over_cache;
   int game_over_valid;
+  unsigned int rng;
 } Checkers;
 
 typedef struct {

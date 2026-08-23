@@ -106,9 +106,9 @@ typedef struct {
     Agent* agents;
     Goal* goals;
     float* observations;
-    int* actions;
+    float* actions;
     float* rewards;
-    unsigned char* terminals;
+    float* terminals;
     int width;
     int height;
     int num_agents;
@@ -117,6 +117,7 @@ typedef struct {
     float mouse_y;
     float mouse_heading;
     char** names;
+    unsigned int rng;
 } OnlyFish;
 
 void init(OnlyFish* env) {

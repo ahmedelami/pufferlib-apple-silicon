@@ -48,9 +48,10 @@ typedef struct {
     float* actions;
     // an array of shape (1) with the summed up reward for all boids
     float* rewards;
-    unsigned char* terminals; // Not being used but is required by env_binding.h
+    float* terminals;
     Boid* boids;
     unsigned int num_boids;
+    int num_agents;
     float margin_turn_factor;
     float centering_factor;
     float avoid_factor;
@@ -60,6 +61,7 @@ typedef struct {
     Log* boid_logs;
     unsigned report_interval;
     Client* client;
+    unsigned int rng;
 
 } Boids;
 
@@ -134,8 +136,10 @@ void c_step(Boids *env) {
             current_boid->velocity.x = flclip(current_boid->velocity.x + (mouse_x - current_boid->x), -VELOCITY_CAP, VELOCITY_CAP);
             current_boid->velocity.y = flclip(current_boid->velocity.y + (mouse_y - current_boid->y), -VELOCITY_CAP, VELOCITY_CAP);
         } else {
-            current_boid->velocity.x = flclip(current_boid->velocity.x + 2*env->actions[current_indx * 2 + 0], -VELOCITY_CAP, VELOCITY_CAP);
-            current_boid->velocity.y = flclip(current_boid->velocity.y + 2*env->actions[current_indx * 2 + 1], -VELOCITY_CAP, VELOCITY_CAP);
+            float ax = (env->actions[current_indx * 2] - 2.0f) / 4.0f;
+            float ay = (env->actions[current_indx * 2 + 1] - 2.0f) / 4.0f;
+            current_boid->velocity.x = flclip(current_boid->velocity.x + 2*ax, -VELOCITY_CAP, VELOCITY_CAP);
+            current_boid->velocity.y = flclip(current_boid->velocity.y + 2*ay, -VELOCITY_CAP, VELOCITY_CAP);
         }
         current_boid->x = flclip(current_boid->x + current_boid->velocity.x, 0, WIDTH  - BOID_WIDTH);
         current_boid->y = flclip(current_boid->y + current_boid->velocity.y, 0, HEIGHT - BOID_HEIGHT);
